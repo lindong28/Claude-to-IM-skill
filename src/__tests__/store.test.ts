@@ -17,6 +17,10 @@ function makeSettings(): Map<string, string> {
   ]);
 }
 
+function mode(filePath: string): number {
+  return fs.statSync(filePath).mode & 0o777;
+}
+
 describe('JsonFileStore', () => {
   beforeEach(() => {
     // Clean data dir before each test for isolation
@@ -86,6 +90,21 @@ describe('JsonFileStore', () => {
     assert.equal(b.mode, 'plan');
   });
 
+  it('does not publish an in-memory binding update when persistence fails', () => {
+    const store = new JsonFileStore(makeSettings());
+    const binding = store.upsertChannelBinding({
+      channelType: 'feishu',
+      chatId: 'group-persist-canary',
+      codepilotSessionId: 'session-persist-canary',
+      workingDirectory: '/tmp',
+      model: '',
+    });
+    (store as any).persistBindings = () => { throw new Error('disk secret-persist-canary'); };
+
+    assert.throws(() => store.updateChannelBinding(binding.id, { recoveryState: 'armed' }));
+    assert.equal(store.getChannelBinding('feishu', 'group-persist-canary')?.recoveryState, undefined);
+  });
+
   it('getChannelBinding returns null for missing', () => {
     const store = new JsonFileStore(makeSettings());
     assert.equal(store.getChannelBinding('telegram', 'missing'), null);
@@ -122,6 +141,21 @@ describe('JsonFileStore', () => {
     assert.equal(messages.length, 2);
     assert.equal(messages[0].role, 'user');
     assert.equal(messages[1].content, 'hi');
+  });
+
+  it('creates private data directories and preserves 0600 across atomic replacement', () => {
+    const store = new JsonFileStore(makeSettings());
+    const session = store.createSession('test', 'model', undefined, '/tmp');
+    const sessionsPath = path.join(DATA_DIR, 'sessions.json');
+    assert.equal(mode(DATA_DIR), 0o700);
+    assert.equal(mode(path.join(DATA_DIR, 'messages')), 0o700);
+    assert.equal(mode(sessionsPath), 0o600);
+
+    fs.chmodSync(sessionsPath, 0o644);
+    store.createSession('second', 'model', undefined, '/tmp');
+    assert.equal(mode(sessionsPath), 0o600);
+    store.addMessage(session.id, 'user', 'private message');
+    assert.equal(mode(path.join(DATA_DIR, 'messages', `${session.id}.json`)), 0o600);
   });
 
   it('getMessages with limit returns last N', () => {

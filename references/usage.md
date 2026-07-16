@@ -2,6 +2,15 @@
 
 This skill works with both **Claude Code** (via `/claude-to-im` slash commands) and **Codex** (via natural language like "start bridge", "配置", "诊断"). All commands below use Claude Code syntax; Codex users can use equivalent natural language.
 
+For any named instance, choose the identity once and keep it on every direct command. `quant-lab` is only the example value used by this plan:
+
+```bash
+INSTANCE=quant-lab
+export CTI_SKILL_DIR="$HOME/.claude/skills/claude-to-im"
+```
+
+The selected name derives home `~/.claude-to-im-$INSTANCE` and label `com.claude-to-im.bridge.$INSTANCE`. Do not change or omit `INSTANCE` after setup; omission targets default.
+
 ## setup
 
 Interactive wizard that configures the bridge.
@@ -35,37 +44,37 @@ Validating tokens...
   Telegram: OK (bot @MyBotName)
   Discord: OK (format valid)
 
-Config written to ~/.claude-to-im/config.env
+Config written to ~/.claude-to-im-<instance>/config.env
 ```
 
 ## start
 
 Starts the bridge daemon in the background.
 
-```
-/claude-to-im start
+```bash
+CTI_INSTANCE="$INSTANCE" bash "$CTI_SKILL_DIR/scripts/daemon.sh" start
 ```
 
-The daemon process ID is stored in `~/.claude-to-im/runtime/bridge.pid`. If the daemon is already running, the command reports the existing process.
+The daemon PID and store are under that instance home. If the daemon is already running, the command reports the existing process.
 
-If startup fails, run `/claude-to-im doctor` to diagnose issues.
+If startup fails, run `CTI_INSTANCE="$INSTANCE" bash "$CTI_SKILL_DIR/scripts/doctor.sh"`.
 
 ## stop
 
 Stops the running bridge daemon.
 
-```
-/claude-to-im stop
+```bash
+CTI_INSTANCE="$INSTANCE" bash "$CTI_SKILL_DIR/scripts/daemon.sh" stop
 ```
 
-Sends SIGTERM to the daemon process and cleans up the PID file.
+Stops/boots out the process while preserving its plist, config, bindings, and message/audit data.
 
 ## status
 
 Shows whether the daemon is running and basic health information.
 
-```
-/claude-to-im status
+```bash
+CTI_INSTANCE="$INSTANCE" bash "$CTI_SKILL_DIR/scripts/daemon.sh" status
 ```
 
 Output includes:
@@ -78,12 +87,21 @@ Output includes:
 
 Shows recent log output from the daemon.
 
-```
-/claude-to-im logs        # Last 50 lines (default)
-/claude-to-im logs 200    # Last 200 lines
+```bash
+CTI_INSTANCE="$INSTANCE" bash "$CTI_SKILL_DIR/scripts/daemon.sh" logs
+CTI_INSTANCE="$INSTANCE" bash "$CTI_SKILL_DIR/scripts/daemon.sh" logs 200
 ```
 
-Logs are stored in `~/.claude-to-im/logs/` and are automatically redacted to mask secrets.
+Logs are stored under the instance home and are automatically redacted to mask secrets.
+
+## uninstall and remove
+
+```bash
+CTI_INSTANCE="$INSTANCE" bash "$CTI_SKILL_DIR/scripts/daemon.sh" uninstall
+CTI_INSTANCE="$INSTANCE" bash "$CTI_SKILL_DIR/scripts/daemon.sh" remove "$INSTANCE"
+```
+
+`uninstall` stops the service and removes its plist but preserves the instance home/store. `remove` requires the instance to be stopped and unregistered, requires the exact instance name as confirmation, and deletes only that named home. The default instance cannot be removed.
 
 ## reconfigure
 
@@ -95,17 +113,17 @@ Interactively update the current configuration.
 
 Displays current settings with secrets masked, then prompts for changes. After updating, you must restart the daemon for changes to take effect:
 
-```
-/claude-to-im stop
-/claude-to-im start
+```bash
+CTI_INSTANCE="$INSTANCE" bash "$CTI_SKILL_DIR/scripts/daemon.sh" stop
+CTI_INSTANCE="$INSTANCE" bash "$CTI_SKILL_DIR/scripts/daemon.sh" start
 ```
 
 ## doctor
 
 Runs diagnostic checks and reports issues.
 
-```
-/claude-to-im doctor
+```bash
+CTI_INSTANCE="$INSTANCE" bash "$CTI_SKILL_DIR/scripts/doctor.sh"
 ```
 
 Checks performed:
@@ -117,6 +135,14 @@ Checks performed:
 - QQ credentials and gateway reachability (if QQ enabled)
 - Daemon process health
 - Log directory writability
+- Lifecycle lock state and a guarded repair command when the owner PID is provably dead
+- Current-run Feishu connection/inbound and Codex success evidence for named Feishu/Codex instances
+
+## Fixed Feishu/Codex session recovery
+
+With `CTI_SESSION_POLICY=fixed-confirm-recovery`, each authorized group keeps one persisted Codex thread and `/cwd`, `/new`, and `/bind` are unavailable. An explicit resume failure marks that group pending and ordinary messages make no provider call. Send `@bot /recover confirm` from the same allowed user/group; this only arms recovery. The next ordinary message creates one replacement thread and consumes the authorization.
+
+With `CTI_CODEX_APPROVAL_POLICY=never`, Codex never emits an interactive permission request, so there is no Feishu permission card or `/perm` step.
 
 ### QQ notes
 

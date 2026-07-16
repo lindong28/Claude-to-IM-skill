@@ -1,6 +1,10 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import crypto from "node:crypto";
+import type { ApprovalMode, SandboxMode } from '@openai/codex-sdk';
+import type { CodexProviderOptions } from './codex-provider.js';
+import { atomicWritePrivateFile, ensurePrivateDirectory } from "./private-files.js";
 
 export interface Config {
   runtime: 'claude' | 'codex' | 'auto';
@@ -17,6 +21,15 @@ export interface Config {
   feishuAppSecret?: string;
   feishuDomain?: string;
   feishuAllowedUsers?: string[];
+  feishuGroupPolicy?: 'open' | 'allowlist' | 'disabled';
+  feishuGroupAllowFrom?: string[];
+  feishuRequireMention?: boolean;
+  sessionPolicy?: 'fixed-confirm-recovery';
+  codexSandboxMode?: SandboxMode;
+  codexApprovalPolicy?: ApprovalMode;
+  codexNetworkAccess?: boolean;
+  /** SHA-256 of the exact private config file read for this process. */
+  configHash?: string;
   // Discord
   discordBotToken?: string;
   discordAllowedUsers?: string[];
@@ -68,19 +81,62 @@ function splitCsv(value: string | undefined): string[] | undefined {
     .filter(Boolean);
 }
 
+function parseStrictBoolean(key: string, value: string | undefined): boolean | undefined {
+  if (value === undefined || value === '') return undefined;
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  throw new Error(`Configuration error: ${key} must be true or false`);
+}
+
+function parseFeishuGroupPolicy(value: string | undefined): Config['feishuGroupPolicy'] {
+  if (value === undefined || value === '') return undefined;
+  if (value === 'open' || value === 'allowlist' || value === 'disabled') return value;
+  throw new Error('Configuration error: CTI_FEISHU_GROUP_POLICY must be open, allowlist, or disabled');
+}
+
+function parseSessionPolicy(value: string | undefined): Config['sessionPolicy'] {
+  if (value === undefined || value === '') return undefined;
+  if (value === 'fixed-confirm-recovery') return value;
+  throw new Error('Configuration error: CTI_SESSION_POLICY must be fixed-confirm-recovery');
+}
+
+function parseCodexSandboxMode(value: string | undefined): Config['codexSandboxMode'] {
+  if (value === undefined || value === '') return undefined;
+  if (value === 'read-only' || value === 'workspace-write' || value === 'danger-full-access') return value;
+  throw new Error('Configuration error: CTI_CODEX_SANDBOX_MODE must be read-only, workspace-write, or danger-full-access');
+}
+
+function parseCodexApprovalPolicy(value: string | undefined): Config['codexApprovalPolicy'] {
+  if (value === undefined || value === '') return undefined;
+  if (value === 'never' || value === 'on-request' || value === 'on-failure' || value === 'untrusted') return value;
+  throw new Error('Configuration error: CTI_CODEX_APPROVAL_POLICY must be never, on-request, on-failure, or untrusted');
+}
+
 export function loadConfig(): Config {
   let env = new Map<string, string>();
+  let configContent: string | undefined;
   try {
     const content = fs.readFileSync(CONFIG_PATH, "utf-8");
+    configContent = content;
     env = parseEnvFile(content);
   } catch {
     // Config file doesn't exist yet — use defaults
   }
 
+  // launchd receives identity and other non-sensitive process controls only.
+  // Restore runtime/provider settings from the private config without allowing
+  // config content to redirect this already-resolved instance.
+  for (const [key, value] of env) {
+    if (["CTI_HOME", "CTI_INSTANCE", "CTI_LAUNCHD_LABEL"].includes(key)) continue;
+    if (/^(?:CTI_|ANTHROPIC_|OPENAI_|CODEX_)/.test(key)) {
+      process.env[key] = value;
+    }
+  }
+
   const rawRuntime = env.get("CTI_RUNTIME") || "claude";
   const runtime = (["claude", "codex", "auto"].includes(rawRuntime) ? rawRuntime : "claude") as Config["runtime"];
 
-  return {
+  const config: Config = {
     runtime,
     enabledChannels: splitCsv(env.get("CTI_ENABLED_CHANNELS")) ?? [],
     defaultWorkDir: env.get("CTI_DEFAULT_WORKDIR") || process.cwd(),
@@ -93,6 +149,19 @@ export function loadConfig(): Config {
     feishuAppSecret: env.get("CTI_FEISHU_APP_SECRET") || undefined,
     feishuDomain: env.get("CTI_FEISHU_DOMAIN") || undefined,
     feishuAllowedUsers: splitCsv(env.get("CTI_FEISHU_ALLOWED_USERS")),
+    feishuGroupPolicy: parseFeishuGroupPolicy(env.get("CTI_FEISHU_GROUP_POLICY")),
+    feishuGroupAllowFrom: splitCsv(env.get("CTI_FEISHU_GROUP_ALLOW_FROM")),
+    feishuRequireMention: parseStrictBoolean(
+      "CTI_FEISHU_REQUIRE_MENTION",
+      env.get("CTI_FEISHU_REQUIRE_MENTION"),
+    ),
+    sessionPolicy: parseSessionPolicy(env.get("CTI_SESSION_POLICY")),
+    codexSandboxMode: parseCodexSandboxMode(env.get('CTI_CODEX_SANDBOX_MODE')),
+    codexApprovalPolicy: parseCodexApprovalPolicy(env.get('CTI_CODEX_APPROVAL_POLICY')),
+    codexNetworkAccess: parseStrictBoolean('CTI_CODEX_NETWORK_ACCESS', env.get('CTI_CODEX_NETWORK_ACCESS')),
+    configHash: configContent === undefined
+      ? undefined
+      : crypto.createHash('sha256').update(configContent).digest('hex'),
     discordBotToken: env.get("CTI_DISCORD_BOT_TOKEN") || undefined,
     discordAllowedUsers: splitCsv(env.get("CTI_DISCORD_ALLOWED_USERS")),
     discordAllowedChannels: splitCsv(
@@ -115,6 +184,35 @@ export function loadConfig(): Config {
       : undefined,
     autoApprove: env.get("CTI_AUTO_APPROVE") === "true",
   };
+  validateConfig(config);
+  return config;
+}
+
+export function validateConfig(config: Config): void {
+  const feishuEnabled = config.enabledChannels.includes('feishu');
+  const fixedFeishu = feishuEnabled && config.sessionPolicy === 'fixed-confirm-recovery';
+  if (!feishuEnabled) return;
+
+  if (fixedFeishu && config.feishuGroupPolicy !== 'allowlist') {
+    throw new Error('Configuration error: CTI_FEISHU_GROUP_POLICY must be allowlist for fixed-confirm-recovery');
+  }
+
+  if (config.feishuGroupPolicy !== 'allowlist') return;
+
+  const required: Array<[string, string | string[] | undefined]> = [
+    ['CTI_FEISHU_APP_ID', config.feishuAppId],
+    ['CTI_FEISHU_APP_SECRET', config.feishuAppSecret],
+    ['CTI_FEISHU_ALLOWED_USERS', config.feishuAllowedUsers],
+    ['CTI_FEISHU_GROUP_ALLOW_FROM', config.feishuGroupAllowFrom],
+  ];
+  for (const [key, value] of required) {
+    if (!value || (Array.isArray(value) && value.length === 0)) {
+      throw new Error(`Configuration error: ${key} is required when Feishu group policy is allowlist`);
+    }
+  }
+  if (fixedFeishu && config.feishuRequireMention !== true) {
+    throw new Error('Configuration error: CTI_FEISHU_REQUIRE_MENTION must be true for fixed-confirm-recovery');
+  }
 }
 
 function formatEnvLine(key: string, value: string | undefined): string {
@@ -130,7 +228,8 @@ export function saveConfig(config: Config): void {
     config.enabledChannels.join(",")
   );
   out += formatEnvLine("CTI_DEFAULT_WORKDIR", config.defaultWorkDir);
-  if (config.defaultModel) out += formatEnvLine("CTI_DEFAULT_MODEL", config.defaultModel);
+  const namedInstance = Boolean(process.env.CTI_INSTANCE && process.env.CTI_INSTANCE !== 'default');
+  if (config.defaultModel && !namedInstance) out += formatEnvLine("CTI_DEFAULT_MODEL", config.defaultModel);
   out += formatEnvLine("CTI_DEFAULT_MODE", config.defaultMode);
   out += formatEnvLine("CTI_TG_BOT_TOKEN", config.tgBotToken);
   out += formatEnvLine("CTI_TG_CHAT_ID", config.tgChatId);
@@ -145,6 +244,18 @@ export function saveConfig(config: Config): void {
     "CTI_FEISHU_ALLOWED_USERS",
     config.feishuAllowedUsers?.join(",")
   );
+  out += formatEnvLine("CTI_FEISHU_GROUP_POLICY", config.feishuGroupPolicy);
+  out += formatEnvLine(
+    "CTI_FEISHU_GROUP_ALLOW_FROM",
+    config.feishuGroupAllowFrom?.join(",")
+  );
+  if (config.feishuRequireMention !== undefined)
+    out += formatEnvLine("CTI_FEISHU_REQUIRE_MENTION", String(config.feishuRequireMention));
+  out += formatEnvLine("CTI_SESSION_POLICY", config.sessionPolicy);
+  out += formatEnvLine('CTI_CODEX_SANDBOX_MODE', config.codexSandboxMode);
+  out += formatEnvLine('CTI_CODEX_APPROVAL_POLICY', config.codexApprovalPolicy);
+  if (config.codexNetworkAccess !== undefined)
+    out += formatEnvLine('CTI_CODEX_NETWORK_ACCESS', String(config.codexNetworkAccess));
   out += formatEnvLine("CTI_DISCORD_BOT_TOKEN", config.discordBotToken);
   out += formatEnvLine(
     "CTI_DISCORD_ALLOWED_USERS",
@@ -173,10 +284,26 @@ export function saveConfig(config: Config): void {
   if (config.weixinMediaEnabled !== undefined)
     out += formatEnvLine("CTI_WEIXIN_MEDIA_ENABLED", String(config.weixinMediaEnabled));
 
-  fs.mkdirSync(CTI_HOME, { recursive: true });
-  const tmpPath = CONFIG_PATH + ".tmp";
-  fs.writeFileSync(tmpPath, out, { mode: 0o600 });
-  fs.renameSync(tmpPath, CONFIG_PATH);
+  ensurePrivateDirectory(CTI_HOME);
+  atomicWritePrivateFile(CONFIG_PATH, out);
+}
+
+export function codexProviderOptionsFromConfig(config: Config): CodexProviderOptions {
+  const options: CodexProviderOptions = {
+    ...(config.codexSandboxMode ? { sandboxMode: config.codexSandboxMode } : {}),
+    ...(config.codexApprovalPolicy ? { approvalPolicy: config.codexApprovalPolicy } : {}),
+    ...(config.codexNetworkAccess !== undefined
+      ? { networkAccessEnabled: config.codexNetworkAccess }
+      : {}),
+    ...(config.sessionPolicy ? { sessionPolicy: config.sessionPolicy } : {}),
+  };
+  if (config.sessionPolicy === 'fixed-confirm-recovery' && config.configHash) {
+    options.audit = {
+      runtimeDirectory: path.join(CTI_HOME, 'runtime'),
+      instanceConfigHash: config.configHash,
+    };
+  }
+  return options;
 }
 
 export function maskSecret(value: string): string {
@@ -186,6 +313,7 @@ export function maskSecret(value: string): string {
 
 export function configToSettings(config: Config): Map<string, string> {
   const m = new Map<string, string>();
+  m.set("bridge_runtime", config.runtime);
   m.set("remote_bridge_enabled", "true");
 
   // ── Telegram ──
@@ -236,6 +364,14 @@ export function configToSettings(config: Config): Map<string, string> {
   if (config.feishuDomain) m.set("bridge_feishu_domain", config.feishuDomain);
   if (config.feishuAllowedUsers)
     m.set("bridge_feishu_allowed_users", config.feishuAllowedUsers.join(","));
+  if (config.feishuGroupPolicy)
+    m.set("bridge_feishu_group_policy", config.feishuGroupPolicy);
+  if (config.feishuGroupAllowFrom)
+    m.set("bridge_feishu_group_allow_from", config.feishuGroupAllowFrom.join(","));
+  if (config.feishuRequireMention !== undefined)
+    m.set("bridge_feishu_require_mention", String(config.feishuRequireMention));
+  if (config.sessionPolicy)
+    m.set("bridge_session_policy", config.sessionPolicy);
 
   // ── QQ ──
   // Upstream keys: bridge_qq_enabled, bridge_qq_app_id, bridge_qq_app_secret,

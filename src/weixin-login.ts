@@ -1,8 +1,8 @@
-import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import QRCode from 'qrcode';
 import { CTI_HOME, loadConfig } from './config.js';
+import { atomicWritePrivateFile, ensurePrivateDirectory } from './private-files.js';
 import { startLoginQr, pollLoginQrStatus } from './adapters/weixin/weixin-api.js';
 import { DEFAULT_BASE_URL, DEFAULT_CDN_BASE_URL } from './adapters/weixin/weixin-types.js';
 import { listWeixinAccounts, upsertWeixinAccount } from './weixin-store.js';
@@ -24,7 +24,7 @@ const RUNTIME_DIR = path.join(CTI_HOME, 'runtime');
 const HTML_PATH = path.join(RUNTIME_DIR, 'weixin-login.html');
 
 function ensureRuntimeDir(): void {
-  fs.mkdirSync(RUNTIME_DIR, { recursive: true });
+  ensurePrivateDirectory(RUNTIME_DIR);
 }
 
 function escapeHtml(text: string): string {
@@ -131,7 +131,7 @@ async function writeQrHtml(session: LoginSession): Promise<void> {
     margin: 0,
     width: 300,
   });
-  fs.writeFileSync(HTML_PATH, buildQrHtml(session, qrSvg), 'utf-8');
+  atomicWritePrivateFile(HTML_PATH, buildQrHtml(session, qrSvg));
 }
 
 function openQrHtml(): boolean {

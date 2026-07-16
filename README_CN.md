@@ -24,7 +24,7 @@ Claude Code / Codex → 读写你的代码库
 
 - **五大 IM 平台** — Telegram、Discord、飞书、QQ、微信，可任意组合启用
 - **交互式配置** — 引导式向导逐步收集 token，附带详细获取说明
-- **权限控制** — 工具调用需要在聊天中通过内联按钮（Telegram/Discord）或文本 `/perm` 命令 / 快捷 `1/2/3` 回复（飞书/QQ/微信）明确批准
+- **权限控制** — 交互式 runtime 使用内联按钮或 `/perm`；Codex approval `never` 由 sandbox 约束，不产生审批提示
 - **流式预览** — 实时查看 Claude 的输出（Telegram 和 Discord 支持）
 - **会话持久化** — 对话在守护进程重启后保留
 - **密钥保护** — token 以 `chmod 600` 存储，日志中自动脱敏
@@ -34,7 +34,7 @@ Claude Code / Codex → 读写你的代码库
 
 - **Node.js >= 20**
 - **Claude Code CLI**（`CTI_RUNTIME=claude` 或 `auto` 时需要）— 已安装并完成认证（`claude` 命令可用）
-- **Codex CLI**（`CTI_RUNTIME=codex` 或 `auto` 时需要）— `npm install -g @openai/codex`。鉴权：运行 `codex auth login`，或设置 `OPENAI_API_KEY`（可选，API 模式）
+- **Codex CLI**（`CTI_RUNTIME=codex` 或 `auto` 时需要）— `npm install -g @openai/codex`。鉴权：运行 `codex login`，或设置 `OPENAI_API_KEY`（可选，API 模式）
 
 ## 安装
 
@@ -212,11 +212,24 @@ start bridge
 
 守护进程在后台启动。关闭终端后仍会继续运行。
 
+### Named instance
+
+配置、生命周期和诊断必须使用同一实例身份。例如：
+
+```bash
+INSTANCE=quant-lab # 本方案示例；只选择一次。
+CTI_INSTANCE="$INSTANCE" bash ~/.claude/skills/claude-to-im/scripts/daemon.sh start
+CTI_INSTANCE="$INSTANCE" bash ~/.claude/skills/claude-to-im/scripts/daemon.sh status
+CTI_INSTANCE="$INSTANCE" bash ~/.claude/skills/claude-to-im/scripts/doctor.sh
+```
+
+`quant-lab` 会推导出 home `~/.claude-to-im-quant-lab` 和 launchd label `com.claude-to-im.bridge.quant-lab`；config、会话绑定、日志、PID、健康状态和审计证据均与 default（`~/.claude-to-im`、`com.claude-to-im.bridge`）隔离。省略 `CTI_INSTANCE` 就会指向 default。
+
 ### 3. 开始聊天
 
 打开 IM 应用，给你的机器人发消息，Claude Code / Codex 会通过桥接回复。
 
-当 Claude 需要使用工具（编辑文件、运行命令）时，聊天中会弹出带有 **允许** / **拒绝** 按钮的权限请求（Telegram/Discord），或文本 `/perm` 命令提示 / 快捷 `1/2/3` 回复（飞书/QQ/微信）。
+交互式 runtime 可能发送权限按钮或 `/perm` 提示。配置 `CTI_CODEX_APPROVAL_POLICY=never` 的 Codex 实例不会请求权限，也不会发送飞书 permission card；工具能力由 sandbox policy 约束。
 
 ## 命令列表
 
@@ -232,6 +245,20 @@ start bridge
 | `/claude-to-im logs 200` | "logs 200" | 查看最近 200 行日志 |
 | `/claude-to-im reconfigure` | "reconfigure" / "修改配置" | 交互式修改配置 |
 | `/claude-to-im doctor` | "doctor" / "诊断" | 诊断问题 |
+
+Named instance 直接使用同一身份运行：
+
+```bash
+CTI_INSTANCE="$INSTANCE" bash ~/.claude/skills/claude-to-im/scripts/daemon.sh start
+CTI_INSTANCE="$INSTANCE" bash ~/.claude/skills/claude-to-im/scripts/daemon.sh stop
+CTI_INSTANCE="$INSTANCE" bash ~/.claude/skills/claude-to-im/scripts/daemon.sh status
+CTI_INSTANCE="$INSTANCE" bash ~/.claude/skills/claude-to-im/scripts/daemon.sh logs 200
+CTI_INSTANCE="$INSTANCE" bash ~/.claude/skills/claude-to-im/scripts/daemon.sh uninstall
+CTI_INSTANCE="$INSTANCE" bash ~/.claude/skills/claude-to-im/scripts/daemon.sh remove "$INSTANCE"
+CTI_INSTANCE="$INSTANCE" bash ~/.claude/skills/claude-to-im/scripts/doctor.sh
+```
+
+`stop` 停止/bootout 进程，但保留 plist 和 home；`uninstall` 还会删除 plist，但保留 home/store；`remove` 要求实例已停止、已注销且确认参数与实例名完全一致，只删除该 named home，并拒绝删除 `default`。
 
 ## 平台配置指南
 
@@ -257,9 +284,10 @@ start bridge
 2. 创建自建应用 → 获取 App ID 和 App Secret
 3. **批量添加权限**：进入"权限管理" → 使用批量配置添加所有必需权限（`setup` 向导提供完整 JSON）
 4. 在"添加应用能力"中启用机器人
-5. **事件与回调**：选择**长连接**作为事件订阅方式 → 添加 `im.message.receive_v1` 事件
-6. **发布**：进入"版本管理与发布" → 创建版本 → 提交审核 → 在管理后台审核通过
-7. **注意**：版本审核通过并发布后机器人才能使用
+5. 同时配置 `CTI_FEISHU_ALLOWED_USERS` 与 `CTI_FEISHU_GROUP_ALLOW_FROM`，group policy 使用 `allowlist`，并要求 @mention；从受控入站事件元数据核对 opaque user/group ID，不把 ID 写入日志
+6. Phase 1 发布后，启动同一实例，再选择**长连接**并添加 `im.message.receive_v1`
+7. 只有 runtime 会产生交互审批卡时才添加 `card.action.trigger`；Codex approval `never` 不需要它
+8. 发布 Phase 2 并完成管理员审批
 
 ### QQ
 
@@ -293,6 +321,8 @@ start bridge
 ## 架构
 
 ```
+
+Named instance 使用 `~/.claude-to-im-<instance>/` 下的同一结构。固定会话策略会给每个获准飞书群持久绑定一个 Codex thread。明确的 resume 失败后，普通消息 fail closed；在同一获准群发送 `@bot /recover confirm` 只会 arm recovery，下一条普通消息才会创建并持久化一次替代 thread，confirm 本身不调用 Codex。
 ~/.claude-to-im/
 ├── config.env             ← 凭据与配置 (chmod 600)
 ├── data/                  ← 持久化 JSON 存储
@@ -323,7 +353,9 @@ start bridge
 | `scripts/doctor.sh` | 诊断检查 |
 | `SKILL.md` | Claude Code Skill 定义文件 |
 
-### 权限流程
+### 交互式权限流程
+
+此流程只适用于所选 runtime 会请求审批的情况；Codex approval `never` 没有该流程。
 
 ```
 1. Claude 想使用工具（如编辑文件）
@@ -350,6 +382,10 @@ start bridge
 | `收不到消息` | 用 `doctor` 验证 token，检查允许用户配置 |
 | `权限超时` | 用户 5 分钟内未响应，工具调用自动拒绝 |
 | `PID 文件残留` | 运行 `stop` 再 `start`，脚本会自动清理 |
+
+Lifecycle lock 与 PID 文件不同。若进程崩溃或断电后 `doctor` 报告已验证的 stale lifecycle lock，只执行它打印的同实例修复命令。修复会拒绝 live、结构异常、owner 不匹配、symlink 或含额外文件的 lock。
+
+固定 Codex 实例会在实例 runtime 目录写入私有 call-envelope/rollout association 证据。目前没有自动 retention/pruning；应在实例停止时按本地策略归档或删除。证据缺失或歧义属于 `audit-unavailable`，不能证明重跑条件相同。关联对 append 歧义、文件替换/轮转和缩短 fail closed；同 inode 原地 truncate 后重新增长超过 checkpoint size 是已知残余边界，不得把这种证据视为可信。
 
 详见 [references/troubleshooting.md](references/troubleshooting.md)。
 

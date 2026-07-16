@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { CTI_HOME } from './config.js';
+import { atomicWritePrivateFile, ensurePrivateDirectory } from './private-files.js';
 
 export interface WeixinAccountRecord {
   accountId: string;
@@ -24,13 +25,11 @@ const DEFAULT_BASE_URL = 'https://ilinkai.weixin.qq.com';
 const DEFAULT_CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c';
 
 function ensureDir(dir: string): void {
-  fs.mkdirSync(dir, { recursive: true });
+  ensurePrivateDirectory(dir);
 }
 
 function atomicWrite(filePath: string, data: string): void {
-  const tmpPath = `${filePath}.tmp`;
-  fs.writeFileSync(tmpPath, data, 'utf-8');
-  fs.renameSync(tmpPath, filePath);
+  atomicWritePrivateFile(filePath, data);
 }
 
 function readJson<T>(filePath: string, fallback: T): T {

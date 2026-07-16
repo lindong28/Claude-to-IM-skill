@@ -24,7 +24,7 @@ Claude Code / Codex → reads/writes your codebase
 
 - **Five IM platforms** — Telegram, Discord, Feishu/Lark, QQ, WeChat — enable any combination
 - **Interactive setup** — guided wizard collects tokens with step-by-step instructions
-- **Permission control** — tool calls require explicit approval via inline buttons (Telegram/Discord) or text `/perm` commands / quick `1/2/3` replies (Feishu/QQ/WeChat)
+- **Permission control** — interactive runtimes use inline buttons or `/perm`; Codex approval `never` relies on its sandbox and emits no approval prompt
 - **Streaming preview** — see Claude's response as it types (Telegram & Discord)
 - **Session persistence** — conversations survive daemon restarts
 - **Secret protection** — tokens stored with `chmod 600`, auto-redacted in all logs
@@ -34,7 +34,7 @@ Claude Code / Codex → reads/writes your codebase
 
 - **Node.js >= 20**
 - **Claude Code CLI** (for `CTI_RUNTIME=claude` or `auto`) — installed and authenticated (`claude` command available)
-- **Codex CLI** (for `CTI_RUNTIME=codex` or `auto`) — `npm install -g @openai/codex`. Auth: run `codex auth login`, or set `OPENAI_API_KEY` (optional, for API mode)
+- **Codex CLI** (for `CTI_RUNTIME=codex` or `auto`) — `npm install -g @openai/codex`. Auth: run `codex login`, or set `OPENAI_API_KEY` (optional, for API mode)
 
 ## Installation
 
@@ -212,11 +212,24 @@ start bridge
 
 The daemon starts in the background. You can close the terminal — it keeps running.
 
+### Named instances
+
+Use one identity for setup, lifecycle, and diagnosis. For example:
+
+```bash
+INSTANCE=quant-lab # Example; choose once.
+CTI_INSTANCE="$INSTANCE" bash ~/.claude/skills/claude-to-im/scripts/daemon.sh start
+CTI_INSTANCE="$INSTANCE" bash ~/.claude/skills/claude-to-im/scripts/daemon.sh status
+CTI_INSTANCE="$INSTANCE" bash ~/.claude/skills/claude-to-im/scripts/doctor.sh
+```
+
+`quant-lab` derives home `~/.claude-to-im-quant-lab` and launchd label `com.claude-to-im.bridge.quant-lab`; its config, session bindings, logs, PID, health, and audit evidence are separate from default (`~/.claude-to-im`, `com.claude-to-im.bridge`). Omitting `CTI_INSTANCE` targets default.
+
 ### 3. Chat
 
 Open your IM app and send a message to your bot. Claude Code / Codex will respond through the bridge.
 
-When Claude needs to use a tool (edit a file, run a command), you'll see a permission prompt with **Allow** / **Deny** buttons right in the chat (Telegram/Discord), or a text `/perm` command prompt / quick `1/2/3` replies (Feishu/QQ/WeChat).
+Interactive runtimes may send permission buttons or `/perm` prompts. A Codex instance configured with `CTI_CODEX_APPROVAL_POLICY=never` never asks for permission and therefore sends no Feishu permission card; tool access is bounded by its sandbox policy instead.
 
 ## Commands
 
@@ -232,6 +245,20 @@ All commands are run inside Claude Code or Codex:
 | `/claude-to-im logs 200` | "logs 200" | Show last 200 log lines |
 | `/claude-to-im reconfigure` | "reconfigure" / "修改配置" | Update config interactively |
 | `/claude-to-im doctor` | "doctor" / "诊断" | Diagnose issues |
+
+For a named instance, run the daemon directly with the same identity:
+
+```bash
+CTI_INSTANCE="$INSTANCE" bash ~/.claude/skills/claude-to-im/scripts/daemon.sh start
+CTI_INSTANCE="$INSTANCE" bash ~/.claude/skills/claude-to-im/scripts/daemon.sh stop
+CTI_INSTANCE="$INSTANCE" bash ~/.claude/skills/claude-to-im/scripts/daemon.sh status
+CTI_INSTANCE="$INSTANCE" bash ~/.claude/skills/claude-to-im/scripts/daemon.sh logs 200
+CTI_INSTANCE="$INSTANCE" bash ~/.claude/skills/claude-to-im/scripts/daemon.sh uninstall
+CTI_INSTANCE="$INSTANCE" bash ~/.claude/skills/claude-to-im/scripts/daemon.sh remove "$INSTANCE"
+CTI_INSTANCE="$INSTANCE" bash ~/.claude/skills/claude-to-im/scripts/doctor.sh
+```
+
+`stop` stops/boots out the process but preserves its plist and home. `uninstall` also removes the plist while preserving the home and store. `remove` requires an exact instance-name confirmation, a stopped/unregistered instance, and deletes only that named home; it refuses `default`.
 
 ## Platform Setup Guides
 
@@ -257,9 +284,10 @@ The `setup` wizard provides inline guidance for every step. Here's a summary:
 2. Create Custom App → get App ID and App Secret
 3. **Batch-add permissions**: go to "Permissions & Scopes" → use batch configuration to add all required scopes (the `setup` wizard provides the exact JSON)
 4. Enable Bot feature under "Add Features"
-5. **Events & Callbacks**: select **"Long Connection"** as event dispatch method → add `im.message.receive_v1` event
-6. **Publish**: go to "Version Management & Release" → create version → submit for review → approve in Admin Console
-7. **Important**: The bot will NOT work until the version is approved and published
+5. Configure both `CTI_FEISHU_ALLOWED_USERS` and `CTI_FEISHU_GROUP_ALLOW_FROM`, set group policy to `allowlist`, and require mentions; verify the opaque user/group IDs from controlled inbound event metadata without logging them
+6. **Events & Callbacks**: after Phase 1 is published and the same instance is running, select **"Long Connection"** → add `im.message.receive_v1`
+7. Add `card.action.trigger` only for a runtime that produces interactive approval cards. It is unnecessary for Codex with approval `never`
+8. **Publish** Phase 2 and obtain admin approval
 
 ### QQ
 
@@ -307,6 +335,8 @@ Additional notes:
     └── status.json         ← Current status
 ```
 
+Named instances use the same layout under `~/.claude-to-im-<instance>/`. The fixed session policy binds one durable Codex thread per authorized Feishu group. If resume fails explicitly, ordinary messages fail closed. Send `@bot /recover confirm` in that same authorized group to arm recovery; the next ordinary message creates and persists one replacement thread. The confirm command itself does not call Codex.
+
 ### Key components
 
 | Component | Role |
@@ -323,7 +353,9 @@ Additional notes:
 | `scripts/doctor.sh` | Health checks |
 | `SKILL.md` | Claude Code skill definition |
 
-### Permission flow
+### Interactive permission flow
+
+This flow applies only when the selected runtime requests approval; it is absent for Codex approval `never`.
 
 ```
 1. Claude wants to use a tool (e.g., Edit file)
@@ -350,6 +382,10 @@ This checks: Node.js version, config file existence and permissions, token valid
 | `Messages not received` | Verify token with `doctor`. Check allowed users config. |
 | `Permission timeout` | User didn't respond within 5 min. Tool call auto-denied. |
 | `Stale PID file` | Run `stop` then `start`. daemon.sh auto-cleans stale PIDs. |
+
+A lifecycle lock is different from the PID file. If `doctor` reports a verified stale lifecycle lock after a crash or power loss, use only the same-instance repair command it prints. The repair refuses live, malformed, mismatched, symlinked, or non-empty lock directories.
+
+Fixed Codex instances write private call-envelope/rollout association evidence under the instance runtime directory. There is no automatic retention or pruning; operators must archive or delete it according to local policy while the instance is stopped. Missing or ambiguous evidence is `audit-unavailable`, not proof that a retry is equivalent. Association fails closed for append ambiguity, file replacement/rotation, and shrinkage. A same-inode file truncated and regrown past its checkpoint size is a known residual boundary and must not be treated as trustworthy evidence.
 
 See [references/troubleshooting.md](references/troubleshooting.md) for more details.
 

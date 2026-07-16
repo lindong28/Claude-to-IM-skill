@@ -1,12 +1,21 @@
 #!/usr/bin/env bash
 # macOS supervisor — launchd-based process management.
-# Sourced by daemon.sh; expects CTI_HOME, SKILL_DIR, PID_FILE, STATUS_FILE, LOG_FILE.
+# Sourced by daemon.sh; expects resolved identity plus runtime paths.
 
-LAUNCHD_LABEL="com.claude-to-im.bridge"
+if [ -z "${CTI_LAUNCHD_LABEL:-}" ]; then
+  # shellcheck source=instance-env.sh
+  source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/instance-env.sh"
+fi
+
+LAUNCHD_LABEL="$CTI_LAUNCHD_LABEL"
 PLIST_DIR="$HOME/Library/LaunchAgents"
 PLIST_FILE="$PLIST_DIR/$LAUNCHD_LABEL.plist"
 
 # ── launchd helpers ──
+
+xml_escape() {
+  printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
 
 # Collect env vars that should be forwarded into the plist.
 # We honour clean_env() logic by reading *after* clean_env runs.
@@ -14,47 +23,30 @@ build_env_dict() {
   local indent="            "
   local dict=""
 
-  # Always forward basics
-  for var in HOME PATH USER SHELL LANG TMPDIR; do
+  # Always forward basics + proxy
+  for var in HOME PATH USER SHELL LANG TMPDIR HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
     local val="${!var:-}"
     [ -z "$val" ] && continue
-    dict+="${indent}<key>${var}</key>\n${indent}<string>${val}</string>\n"
+    val=$(xml_escape "$val")
+    dict+="${indent}<key>${var}</key>"
+    dict+=$'\n'
+    dict+="${indent}<string>${val}</string>"
+    dict+=$'\n'
   done
 
-  # Forward CTI_* vars
-  while IFS='=' read -r name val; do
-    case "$name" in CTI_*)
-      dict+="${indent}<key>${name}</key>\n${indent}<string>${val}</string>\n"
-      ;; esac
-  done < <(env)
+  # Identity and non-sensitive process controls only. Credentials and channel
+  # allowlists are loaded by the process from the private config.env.
+  for var in CTI_HOME CTI_INSTANCE; do
+    local val="${!var:-}"
+    [ -z "$val" ] && continue
+    val=$(xml_escape "$val")
+    dict+="${indent}<key>${var}</key>"
+    dict+=$'\n'
+    dict+="${indent}<string>${val}</string>"
+    dict+=$'\n'
+  done
 
-  # Forward runtime-specific API keys
-  local runtime
-  runtime=$(grep "^CTI_RUNTIME=" "$CTI_HOME/config.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d "'" | tr -d '"' || true)
-  runtime="${runtime:-claude}"
-
-  case "$runtime" in
-    codex|auto)
-      for var in OPENAI_API_KEY CODEX_API_KEY CTI_CODEX_API_KEY CTI_CODEX_BASE_URL; do
-        local val="${!var:-}"
-        [ -z "$val" ] && continue
-        dict+="${indent}<key>${var}</key>\n${indent}<string>${val}</string>\n"
-      done
-      ;;
-  esac
-  case "$runtime" in
-    claude|auto)
-      # Auto-forward all ANTHROPIC_* env vars (sourced from config.env by daemon.sh).
-      # Third-party API providers need these to reach the CLI subprocess.
-      while IFS='=' read -r name val; do
-        case "$name" in ANTHROPIC_*)
-          dict+="${indent}<key>${name}</key>\n${indent}<string>${val}</string>\n"
-          ;; esac
-      done < <(env)
-      ;;
-  esac
-
-  echo -e "$dict"
+  printf '%s' "$dict"
 }
 
 generate_plist() {
@@ -64,6 +56,19 @@ generate_plist() {
   mkdir -p "$PLIST_DIR"
   local env_dict
   env_dict=$(build_env_dict)
+  local node_path_xml label_xml skill_dir_xml log_file_xml
+  node_path_xml=$(xml_escape "$node_path")
+  label_xml=$(xml_escape "$LAUNCHD_LABEL")
+  skill_dir_xml=$(xml_escape "$SKILL_DIR")
+  log_file_xml=$(xml_escape "$LOG_FILE")
+
+  # Build optional Node.js flags
+  local node_flags=""
+  # Enable --use-env-proxy when proxy env vars are set and Node supports it
+  if [ -n "${HTTP_PROXY:-}${HTTPS_PROXY:-}${http_proxy:-}${https_proxy:-}" ] && \
+     "$node_path" --use-env-proxy -e "" 2>/dev/null; then
+    node_flags="--use-env-proxy"
+  fi
 
   cat > "$PLIST_FILE" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -71,21 +76,25 @@ generate_plist() {
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>${LAUNCHD_LABEL}</string>
+    <string>${label_xml}</string>
 
     <key>ProgramArguments</key>
     <array>
-        <string>${node_path}</string>
-        <string>${SKILL_DIR}/dist/daemon.mjs</string>
+        <string>${node_path_xml}</string>
+${node_flags:+        <string>${node_flags}</string>
+}        <string>${skill_dir_xml}/dist/daemon.mjs</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>${SKILL_DIR}</string>
+    <string>${skill_dir_xml}</string>
 
     <key>StandardOutPath</key>
-    <string>${LOG_FILE}</string>
+    <string>${log_file_xml}</string>
     <key>StandardErrorPath</key>
-    <string>${LOG_FILE}</string>
+    <string>${log_file_xml}</string>
+
+    <key>Umask</key>
+    <integer>63</integer>
 
     <key>RunAtLoad</key>
     <false/>
@@ -105,20 +114,48 @@ ${env_dict}    </dict>
 </dict>
 </plist>
 PLIST
+  chmod 600 "$PLIST_FILE"
 }
 
 # ── Public interface (called by daemon.sh) ──
 
+supervisor_bootout_selected() {
+  local output
+  if output=$(launchctl bootout "gui/$(id -u)/$LAUNCHD_LABEL" 2>&1); then
+    return 0
+  fi
+  if echo "$output" | grep -qiE 'no such process|could not find service|service not found'; then
+    return 0
+  fi
+  echo "Failed to stop selected LaunchAgent $LAUNCHD_LABEL." >&2
+  return 1
+}
+
+supervisor_assert_selected_stopped() {
+  if supervisor_is_managed || supervisor_is_running; then
+    echo "Selected LaunchAgent $LAUNCHD_LABEL is still managed or running." >&2
+    return 1
+  fi
+}
+
 supervisor_start() {
-  launchctl bootout "gui/$(id -u)/$LAUNCHD_LABEL" 2>/dev/null || true
+  supervisor_bootout_selected
+  supervisor_assert_selected_stopped
   generate_plist
   launchctl bootstrap "gui/$(id -u)" "$PLIST_FILE"
   launchctl kickstart -k "gui/$(id -u)/$LAUNCHD_LABEL"
 }
 
 supervisor_stop() {
-  launchctl bootout "gui/$(id -u)/$LAUNCHD_LABEL" 2>/dev/null || true
+  supervisor_bootout_selected
+  supervisor_assert_selected_stopped
   rm -f "$PID_FILE"
+}
+
+supervisor_uninstall() {
+  supervisor_stop
+  supervisor_assert_selected_stopped
+  rm -f "$PLIST_FILE"
 }
 
 supervisor_is_managed() {

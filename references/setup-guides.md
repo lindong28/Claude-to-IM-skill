@@ -129,6 +129,7 @@ Enter comma-separated IDs. Leave empty to allow all servers the bot is in.
       "im:message.reactions:read",
       "im:message.reactions:write_only",
       "im:chat:read",
+      "im:chat.members:read",
       "im:resource",
       "cardkit:card:write",
       "cardkit:card:read"
@@ -155,13 +156,39 @@ If the batch import UI is not available, add each scope manually via the search 
 
 **The bot will NOT work until this version is approved.**
 
+### Access policy for a named group bot
+
+Choose the instance once (`INSTANCE=quant-lab` for this plan), then collect and verify all of these before starting:
+
+```dotenv
+CTI_FEISHU_ALLOWED_USERS=ou_allowed_user
+CTI_FEISHU_GROUP_POLICY=allowlist
+CTI_FEISHU_GROUP_ALLOW_FROM=oc_allowed_group
+CTI_FEISHU_REQUIRE_MENTION=true
+```
+
+`CTI_FEISHU_ALLOWED_USERS` contains sender `open_id` values; `CTI_FEISHU_GROUP_ALLOW_FROM` contains group chat IDs. Collect them without weakening startup policy:
+
+1. Finish Phase 1 with `im:chat:read` and `im:chat.members:read`, publish it, and add the bot to the target group.
+2. In the authenticated Feishu API Explorer, call **List chats** (`GET /open-apis/im/v1/chats`) and copy the target group's `chat_id` directly into the private config as `CTI_FEISHU_GROUP_ALLOW_FROM`.
+3. In the same explorer, call **List chat members** (`GET /open-apis/im/v1/chats/:chat_id/members`) with `member_id_type=open_id`; copy the intended sender's `member_id` directly into `CTI_FEISHU_ALLOWED_USERS`.
+4. Set `CTI_FEISHU_GROUP_POLICY=allowlist` and `CTI_FEISHU_REQUIRE_MENTION=true`, keep config mode `0600`, then run config preflight/start. Do not temporarily use open policy, disable mention, start a bootstrap daemon, or paste IDs/secrets into chat, shared logs, shell history, plist, or docs.
+
+The named daemon rejects fixed recovery when either allowlist is empty or require-mention is missing/false.
+
 ### Phase 2: Event subscription (requires running bridge)
 
 > The bridge service must be running before configuring events. Feishu validates the WebSocket connection when saving event subscription — if the bridge is not running, you'll get "未检测到应用连接信息" (connection not detected) error.
 
 **Step D — Start the bridge service**
 
-Run `/claude-to-im start` in Claude Code. This establishes the WebSocket long connection that Feishu needs to detect.
+Start the same instance used for configuration. Example:
+
+```bash
+CTI_INSTANCE="$INSTANCE" bash ~/.claude/skills/claude-to-im/scripts/daemon.sh start
+```
+
+This establishes the WebSocket long connection that Feishu needs to detect.
 
 **Step E — Configure Events & Callbacks (long connection)**
 
@@ -169,8 +196,7 @@ Run `/claude-to-im start` in Claude Code. This establishes the WebSocket long co
 2. Under **"Event Dispatch Method"**, select **"Long Connection"** (长连接 / WebSocket mode)
 3. Click **"Add Event"** and add:
    - `im.message.receive_v1` — Receive messages
-4. Click **"Add Callback"** and add:
-   - `card.action.trigger` — Card interaction callback (for permission approval buttons)
+4. If the runtime can produce interactive approval cards, click **"Add Callback"** and add `card.action.trigger`. Skip this callback for a Codex instance configured with `CTI_CODEX_APPROVAL_POLICY=never`; it cannot produce a permission card.
 5. Click **"Save"**
 
 **Step F — Second publish (makes event subscription effective)**
@@ -190,10 +216,10 @@ If you already have a Feishu app configured, you need to:
    - `im:message:update` — Real-time card content updates
    - `im:message.reactions:read`, `im:message.reactions:write_only` — Typing indicator
 2. **Publish a new version** — Permission changes only take effect after a new version is approved
-3. **Start (or restart) the bridge** — Run `/claude-to-im start` so the WebSocket connection is active
-4. **Add callback**: Go to Events & Callbacks, add `card.action.trigger` callback (card interaction for permission buttons). This step requires the bridge to be running — Feishu validates the WebSocket connection when saving.
+3. **Start (or restart) the same instance** — Run `CTI_INSTANCE="$INSTANCE" bash ~/.claude/skills/claude-to-im/scripts/daemon.sh start` so the WebSocket connection is active
+4. **Add callback only when needed**: Add `card.action.trigger` only for a runtime that produces interactive approval cards. Skip it for Codex approval `never`. Saving a callback requires the bridge to be running.
 5. **Publish again** — The new callback requires another version publish + admin approval
-6. **Restart the bridge** — Run `/claude-to-im stop` then `/claude-to-im start` to pick up the new capabilities
+6. **Restart the same instance** — Run `CTI_INSTANCE="$INSTANCE" bash ~/.claude/skills/claude-to-im/scripts/daemon.sh stop`, then the corresponding `start`, without changing or omitting `INSTANCE`
 
 ### Domain (optional)
 
@@ -206,6 +232,8 @@ Leave empty to use the default Feishu domain.
 Feishu user IDs (open_id format like `ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`).
 You can find them in the Feishu Admin Console under user profiles.
 Leave empty to allow all users who can message the bot.
+
+For named group bots, this field is required rather than optional; configure a non-empty group allowlist and mention requirement as shown above.
 
 ---
 

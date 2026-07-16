@@ -21,6 +21,7 @@ import type {
 } from 'claude-to-im/src/lib/bridge/host.js';
 import type { ChannelBinding, ChannelType } from 'claude-to-im/src/lib/bridge/types.js';
 import { CTI_HOME } from './config.js';
+import { atomicWritePrivateFile, ensurePrivateDirectory } from './private-files.js';
 
 const DATA_DIR = path.join(CTI_HOME, 'data');
 const MESSAGES_DIR = path.join(DATA_DIR, 'messages');
@@ -28,13 +29,11 @@ const MESSAGES_DIR = path.join(DATA_DIR, 'messages');
 // ── Helpers ──
 
 function ensureDir(dir: string): void {
-  fs.mkdirSync(dir, { recursive: true });
+  ensurePrivateDirectory(dir);
 }
 
 function atomicWrite(filePath: string, data: string): void {
-  const tmp = filePath + '.tmp';
-  fs.writeFileSync(tmp, data, 'utf-8');
-  fs.renameSync(tmp, filePath);
+  atomicWritePrivateFile(filePath, data);
 }
 
 function readJson<T>(filePath: string, fallback: T): T {
@@ -145,10 +144,10 @@ export class JsonFileStore implements BridgeStore {
     );
   }
 
-  private persistBindings(): void {
+  private persistBindings(bindings: Map<string, ChannelBinding> = this.bindings): void {
     writeJson(
       path.join(DATA_DIR, 'bindings.json'),
-      Object.fromEntries(this.bindings),
+      Object.fromEntries(bindings),
     );
   }
 
@@ -242,8 +241,10 @@ export class JsonFileStore implements BridgeStore {
   updateChannelBinding(id: string, updates: Partial<ChannelBinding>): void {
     for (const [key, b] of this.bindings) {
       if (b.id === id) {
-        this.bindings.set(key, { ...b, ...updates, updatedAt: now() });
-        this.persistBindings();
+        const next = new Map(this.bindings);
+        next.set(key, { ...b, ...updates, updatedAt: now() });
+        this.persistBindings(next);
+        this.bindings = next;
         break;
       }
     }

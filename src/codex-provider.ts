@@ -13,10 +13,24 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import type {
+  ApprovalMode,
+  SandboxMode,
+  ThreadEvent,
+  ThreadOptions,
+} from '@openai/codex-sdk';
 
 import type { LLMProvider, StreamChatParams } from 'claude-to-im/src/lib/bridge/host.js';
 import type { PendingPermissions } from './permission-gateway.js';
 import { sseEvent } from './sse-utils.js';
+import {
+  associateCodexRollout,
+  buildAuditedCallEnvelope,
+  captureCodexRolloutCheckpoint,
+  hashRepositoryInstructionSnapshot,
+  persistCodexCallEnvelope,
+} from './codex-audit.js';
 
 /** MIME → file extension for temp image files. */
 const MIME_EXT: Record<string, string> = {
@@ -35,18 +49,48 @@ type CodexInstance = any;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type ThreadInstance = any;
 
+export interface CodexProviderOptions {
+  sandboxMode?: SandboxMode;
+  approvalPolicy?: ApprovalMode;
+  networkAccessEnabled?: boolean;
+  sessionPolicy?: 'fixed-confirm-recovery';
+  audit?: {
+    runtimeDirectory: string;
+    instanceConfigHash: string;
+    sessionsRoot?: string;
+    sdkVersion?: string;
+  };
+}
+
 /**
  * Map bridge permission modes to Codex approval policies.
  * - 'acceptEdits' (code mode) → 'on-failure' (auto-approve most things)
  * - 'plan' → 'on-request' (ask before executing)
  * - 'default' (ask mode) → 'on-request'
  */
-function toApprovalPolicy(permissionMode?: string): string {
+function toApprovalPolicy(permissionMode?: string): ApprovalMode {
   switch (permissionMode) {
     case 'acceptEdits': return 'on-failure';
     case 'plan': return 'on-request';
     case 'default': return 'on-request';
     default: return 'on-request';
+  }
+}
+
+function installedCodexSdkVersion(): string {
+  try {
+    const packageFile = path.join(
+      path.dirname(fileURLToPath(import.meta.url)),
+      '..',
+      'node_modules',
+      '@openai',
+      'codex-sdk',
+      'package.json',
+    );
+    const pkg = JSON.parse(fs.readFileSync(packageFile, 'utf8')) as { version?: unknown };
+    return typeof pkg.version === 'string' ? pkg.version : 'unknown';
+  } catch {
+    return 'unknown';
   }
 }
 
@@ -60,13 +104,38 @@ function shouldSkipGitRepoCheck(): boolean {
   return process.env.CTI_CODEX_SKIP_GIT_REPO_CHECK === 'true';
 }
 
-function shouldRetryFreshThread(message: string): boolean {
+function isExplicitResumeFailure(message: string): boolean {
   const lower = message.toLowerCase();
   return (
     lower.includes('resuming session with different model') ||
     lower.includes('no such session') ||
-    (lower.includes('resume') && lower.includes('session'))
+    (lower.includes('session') && lower.includes('not found')) ||
+    (lower.includes('no rollout found') && lower.includes('thread id')) ||
+    (lower.includes('failed to parse') && lower.includes('rollout')) ||
+    ((lower.includes('corrupt') || lower.includes('incompatible'))
+      && (lower.includes('session') || lower.includes('rollout')))
   );
+}
+
+function eventErrorMessage(event: ThreadEvent): string | undefined {
+  if (event.type === 'turn.failed') return event.error?.message;
+  if (event.type === 'error') return event.message;
+  return undefined;
+}
+
+function sanitizedCodexError(message: string | undefined, fallback: string): string {
+  if (!message) return fallback;
+  const lower = message.toLowerCase();
+  if (/auth|unauthorized|api[ _-]?key|not logged in|login/.test(lower)) {
+    return 'Codex authentication failed.';
+  }
+  if (/network|connection|econn|timed? ?out|dns|socket/.test(lower)) {
+    return 'Codex network request failed.';
+  }
+  if (/working directory|\bcwd\b|not a directory|no such file or directory/.test(lower)) {
+    return 'Codex working directory is unavailable.';
+  }
+  return 'Codex request failed.';
 }
 
 export class CodexProvider implements LLMProvider {
@@ -76,7 +145,10 @@ export class CodexProvider implements LLMProvider {
   /** Maps session IDs to Codex thread IDs for resume. */
   private threadIds = new Map<string, string>();
 
-  constructor(private pendingPerms: PendingPermissions) {}
+  constructor(
+    private pendingPerms: PendingPermissions,
+    private options: CodexProviderOptions = {},
+  ) {}
 
   /**
    * Lazily load the Codex SDK. Throws a clear error if not installed.
@@ -122,17 +194,26 @@ export class CodexProvider implements LLMProvider {
             const { codex } = await self.ensureSDK();
 
             // Resolve or create thread
+            const fixedRecovery = (self.options.sessionPolicy || params.sessionPolicy) === 'fixed-confirm-recovery';
             const inMemoryThreadId = self.threadIds.get(params.sessionId);
-            let savedThreadId = inMemoryThreadId || params.sdkSessionId || undefined;
+            let savedThreadId = params.forceFreshThread
+              ? undefined
+              : (fixedRecovery
+                ? (params.sdkSessionId || undefined)
+                : (inMemoryThreadId || params.sdkSessionId || undefined));
 
-            const approvalPolicy = toApprovalPolicy(params.permissionMode);
-            const passModel = shouldPassModelToCodex();
+            const approvalPolicy = self.options.approvalPolicy || toApprovalPolicy(params.permissionMode);
+            const passModel = shouldPassModelToCodex() && !fixedRecovery;
 
-            const threadOptions: Record<string, unknown> = {
+            const threadOptions: ThreadOptions = {
               ...(passModel && params.model ? { model: params.model } : {}),
               ...(params.workingDirectory ? { workingDirectory: params.workingDirectory } : {}),
               ...(shouldSkipGitRepoCheck() ? { skipGitRepoCheck: true } : {}),
+              ...(self.options.sandboxMode ? { sandboxMode: self.options.sandboxMode } : {}),
               approvalPolicy,
+              ...(self.options.networkAccessEnabled !== undefined
+                ? { networkAccessEnabled: self.options.networkAccessEnabled }
+                : {}),
             };
 
             // Build input: Codex SDK UserInput supports { type: "text" } and
@@ -159,25 +240,46 @@ export class CodexProvider implements LLMProvider {
               input = params.prompt;
             }
 
+            const auditSessionsRoot = self.options.audit
+              ? (self.options.audit.sessionsRoot
+                || path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'sessions'))
+              : undefined;
+
             let retryFresh = false;
 
-            while (true) {
+            attemptLoop: while (true) {
               let thread: ThreadInstance;
               if (savedThreadId) {
                 try {
                   thread = codex.resumeThread(savedThreadId, threadOptions);
-                } catch {
-                  thread = codex.startThread(threadOptions);
+                } catch (err) {
+                  const message = err instanceof Error ? err.message : String(err);
+                  if (isExplicitResumeFailure(message) && fixedRecovery) {
+                    controller.enqueue(sseEvent('recovery_required', 'resume unavailable'));
+                    controller.close();
+                    return;
+                  }
+                  if (isExplicitResumeFailure(message) && !retryFresh) {
+                    savedThreadId = undefined;
+                    retryFresh = true;
+                    continue;
+                  }
+                  throw err;
                 }
               } else {
                 thread = codex.startThread(threadOptions);
               }
 
               let sawAnyEvent = false;
+              let candidateThreadId: string | undefined;
               try {
+                const auditCheckpoint = auditSessionsRoot
+                  ? captureCodexRolloutCheckpoint(auditSessionsRoot)
+                  : undefined;
                 const { events } = await thread.runStreamed(input);
 
-                for await (const event of events) {
+                for await (const rawEvent of events) {
+                  const event = rawEvent as ThreadEvent;
                   sawAnyEvent = true;
                   if (params.abortController?.signal.aborted) {
                     break;
@@ -185,12 +287,7 @@ export class CodexProvider implements LLMProvider {
 
                   switch (event.type) {
                     case 'thread.started': {
-                      const threadId = event.thread_id as string;
-                      self.threadIds.set(params.sessionId, threadId);
-
-                      controller.enqueue(sseEvent('status', {
-                        session_id: threadId,
-                      }));
+                      candidateThreadId = event.thread_id;
                       break;
                     }
 
@@ -202,7 +299,49 @@ export class CodexProvider implements LLMProvider {
 
                     case 'turn.completed': {
                       const usage = event.usage as Record<string, unknown> | undefined;
-                      const threadId = self.threadIds.get(params.sessionId);
+                      const threadId = candidateThreadId || savedThreadId;
+                      if (threadId && self.options.audit && auditSessionsRoot && auditCheckpoint) {
+                        try {
+                          const workingDirectory = params.workingDirectory || process.cwd();
+                          const association = associateCodexRollout(
+                            auditSessionsRoot,
+                            threadId,
+                            params.prompt,
+                            auditCheckpoint,
+                          );
+                          if (!association) throw new Error('rollout association unavailable');
+                          const audited = buildAuditedCallEnvelope({
+                            effectiveModel: association.effectiveModel,
+                            sdkVersion: self.options.audit.sdkVersion || installedCodexSdkVersion(),
+                            cliVersion: association.cliVersion,
+                            threadId,
+                            input: params.prompt,
+                            conversationHistory: params.conversationHistory || [],
+                            attachments: params.files || [],
+                            workingDirectory,
+                            repoInstructionSnapshotHash: hashRepositoryInstructionSnapshot(workingDirectory),
+                            ...(self.options.sandboxMode ? { sandboxMode: self.options.sandboxMode } : {}),
+                            approvalPolicy,
+                            ...(self.options.networkAccessEnabled !== undefined
+                              ? { networkAccessEnabled: self.options.networkAccessEnabled }
+                              : {}),
+                            instanceConfigHash: self.options.audit.instanceConfigHash,
+                            rolloutAssociation: association,
+                          });
+                          persistCodexCallEnvelope(self.options.audit.runtimeDirectory, audited);
+                          controller.enqueue(sseEvent('status', {
+                            call_envelope_hash: audited.hash,
+                            effective_model: association.effectiveModel,
+                          }));
+                        } catch {
+                          console.warn('[codex-provider] Audit evidence unavailable for completed turn.');
+                          controller.enqueue(sseEvent('status', { audit_status: 'unavailable' }));
+                        }
+                      }
+                      if (threadId) {
+                        self.threadIds.set(params.sessionId, threadId);
+                        controller.enqueue(sseEvent('status', { session_id: threadId }));
+                      }
 
                       controller.enqueue(sseEvent('result', {
                         usage: usage ? {
@@ -212,19 +351,29 @@ export class CodexProvider implements LLMProvider {
                         } : undefined,
                         ...(threadId ? { session_id: threadId } : {}),
                       }));
-                      break;
+                      break attemptLoop;
                     }
 
-                    case 'turn.failed': {
-                      const error = (event as { message?: string }).message;
-                      controller.enqueue(sseEvent('error', error || 'Turn failed'));
-                      break;
-                    }
-
+                    case 'turn.failed':
                     case 'error': {
-                      const error = (event as { message?: string }).message;
-                      controller.enqueue(sseEvent('error', error || 'Thread error'));
-                      break;
+                      const message = eventErrorMessage(event);
+                      if (savedThreadId && isExplicitResumeFailure(message || '')) {
+                        if (fixedRecovery) {
+                          controller.enqueue(sseEvent('recovery_required', 'resume unavailable'));
+                          controller.close();
+                          return;
+                        }
+                        if (!retryFresh) {
+                          savedThreadId = undefined;
+                          retryFresh = true;
+                          continue attemptLoop;
+                        }
+                      }
+                      controller.enqueue(sseEvent(
+                        'error',
+                        sanitizedCodexError(message, event.type === 'turn.failed' ? 'Turn failed' : 'Thread error'),
+                      ));
+                      break attemptLoop;
                     }
 
                     // item.started, item.updated, turn.started — no action needed
@@ -233,8 +382,13 @@ export class CodexProvider implements LLMProvider {
                 break;
               } catch (err) {
                 const message = err instanceof Error ? err.message : String(err);
-                if (savedThreadId && !retryFresh && !sawAnyEvent && shouldRetryFreshThread(message)) {
-                  console.warn('[codex-provider] Resume failed, retrying with a fresh thread:', message);
+                if (savedThreadId && fixedRecovery && isExplicitResumeFailure(message)) {
+                  controller.enqueue(sseEvent('recovery_required', 'resume unavailable'));
+                  controller.close();
+                  return;
+                }
+                if (savedThreadId && !retryFresh && !sawAnyEvent && isExplicitResumeFailure(message)) {
+                  console.warn('[codex-provider] Resume state unavailable; retrying with a fresh thread');
                   savedThreadId = undefined;
                   retryFresh = true;
                   continue;
@@ -246,9 +400,10 @@ export class CodexProvider implements LLMProvider {
             controller.close();
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
-            console.error('[codex-provider] Error:', err instanceof Error ? err.stack || err.message : err);
+            const safeMessage = sanitizedCodexError(message, 'Codex request failed.');
+            console.error('[codex-provider] Error:', safeMessage);
             try {
-              controller.enqueue(sseEvent('error', message));
+              controller.enqueue(sseEvent('error', safeMessage));
               controller.close();
             } catch {
               // Controller already closed

@@ -15,16 +15,23 @@ import 'claude-to-im/src/lib/bridge/adapters/index.js';
 import './adapters/weixin-adapter.js';
 
 import type { LLMProvider } from 'claude-to-im/src/lib/bridge/host.js';
-import { loadConfig, configToSettings, CTI_HOME } from './config.js';
+import { loadConfig, configToSettings, codexProviderOptionsFromConfig, CTI_HOME } from './config.js';
 import type { Config } from './config.js';
 import { JsonFileStore } from './store.js';
 import { SDKLLMProvider, resolveClaudeCliPath, preflightCheck } from './llm-provider.js';
 import { PendingPermissions } from './permission-gateway.js';
 import { setupLogger } from './logger.js';
+import {
+  atomicWritePrivateFile,
+  ensurePrivateDirectory,
+} from './private-files.js';
+import { safeFailureSummary } from './failure-sanitizer.js';
+import { createExternalHealthReporter, resetExternalHealthStatus } from './health-status.js';
 
 const RUNTIME_DIR = path.join(CTI_HOME, 'runtime');
 const STATUS_FILE = path.join(RUNTIME_DIR, 'status.json');
 const PID_FILE = path.join(RUNTIME_DIR, 'bridge.pid');
+const EXTERNAL_HEALTH_FILE = path.join(RUNTIME_DIR, 'external-health.json');
 
 /**
  * Resolve the LLM provider based on the runtime setting.
@@ -37,7 +44,7 @@ async function resolveProvider(config: Config, pendingPerms: PendingPermissions)
 
   if (runtime === 'codex') {
     const { CodexProvider } = await import('./codex-provider.js');
-    return new CodexProvider(pendingPerms);
+    return new CodexProvider(pendingPerms, codexProviderOptionsFromConfig(config));
   }
 
   if (runtime === 'auto') {
@@ -58,7 +65,7 @@ async function resolveProvider(config: Config, pendingPerms: PendingPermissions)
       console.log('[claude-to-im] Auto: Claude CLI not found, falling back to Codex');
     }
     const { CodexProvider } = await import('./codex-provider.js');
-    return new CodexProvider(pendingPerms);
+    return new CodexProvider(pendingPerms, codexProviderOptionsFromConfig(config));
   }
 
   // Default: claude
@@ -105,27 +112,31 @@ interface StatusInfo {
 }
 
 function writeStatus(info: StatusInfo): void {
-  fs.mkdirSync(RUNTIME_DIR, { recursive: true });
+  ensurePrivateDirectory(RUNTIME_DIR);
   // Merge with existing status to preserve fields like lastExitReason
   let existing: Record<string, unknown> = {};
   try { existing = JSON.parse(fs.readFileSync(STATUS_FILE, 'utf-8')); } catch { /* first write */ }
   const merged = { ...existing, ...info };
-  const tmp = STATUS_FILE + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(merged, null, 2), 'utf-8');
-  fs.renameSync(tmp, STATUS_FILE);
+  atomicWritePrivateFile(STATUS_FILE, JSON.stringify(merged, null, 2));
 }
 
 async function main(): Promise<void> {
   const config = loadConfig();
-  setupLogger();
+  setupLogger({
+    secrets: [config.feishuAppSecret, config.tgBotToken, config.discordBotToken, config.qqAppSecret],
+    identifiers: [...(config.feishuAllowedUsers || []), ...(config.feishuGroupAllowFrom || [])],
+  });
 
   const runId = crypto.randomUUID();
+  const runStartedAt = new Date().toISOString();
+  resetExternalHealthStatus(EXTERNAL_HEALTH_FILE);
   console.log(`[claude-to-im] Starting bridge (run_id: ${runId})`);
 
   const settings = configToSettings(config);
   const store = new JsonFileStore(settings);
   const pendingPerms = new PendingPermissions();
   const llm = await resolveProvider(config, pendingPerms);
+  const reportExternalHealth = createExternalHealthReporter(EXTERNAL_HEALTH_FILE);
   console.log(`[claude-to-im] Runtime: ${config.runtime}`);
 
   const gateway = {
@@ -140,13 +151,13 @@ async function main(): Promise<void> {
     lifecycle: {
       onBridgeStart: () => {
         // Write authoritative PID from the actual process (not shell $!)
-        fs.mkdirSync(RUNTIME_DIR, { recursive: true });
-        fs.writeFileSync(PID_FILE, String(process.pid), 'utf-8');
+        ensurePrivateDirectory(RUNTIME_DIR);
+        atomicWritePrivateFile(PID_FILE, String(process.pid));
         writeStatus({
           running: true,
           pid: process.pid,
           runId,
-          startedAt: new Date().toISOString(),
+          startedAt: runStartedAt,
           channels: config.enabledChannels,
         });
         console.log(`[claude-to-im] Bridge started (PID: ${process.pid}, channels: ${config.enabledChannels.join(', ')})`);
@@ -155,6 +166,7 @@ async function main(): Promise<void> {
         writeStatus({ running: false });
         console.log('[claude-to-im] Bridge stopped');
       },
+      onExternalHealth: reportExternalHealth,
     },
   });
 
@@ -179,12 +191,14 @@ async function main(): Promise<void> {
 
   // ── Exit diagnostics ──
   process.on('unhandledRejection', (reason) => {
-    console.error('[claude-to-im] unhandledRejection:', reason instanceof Error ? reason.stack || reason.message : reason);
-    writeStatus({ running: false, lastExitReason: `unhandledRejection: ${reason instanceof Error ? reason.message : String(reason)}` });
+    const summary = safeFailureSummary('unhandledRejection', reason);
+    console.error(`[claude-to-im] ${summary}`);
+    writeStatus({ running: false, lastExitReason: summary });
   });
   process.on('uncaughtException', (err) => {
-    console.error('[claude-to-im] uncaughtException:', err.stack || err.message);
-    writeStatus({ running: false, lastExitReason: `uncaughtException: ${err.message}` });
+    const summary = safeFailureSummary('uncaughtException', err);
+    console.error(`[claude-to-im] ${summary}`);
+    writeStatus({ running: false, lastExitReason: summary });
     process.exit(1);
   });
   process.on('beforeExit', (code) => {
@@ -201,7 +215,8 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  console.error('[claude-to-im] Fatal error:', err instanceof Error ? err.stack || err.message : err);
-  try { writeStatus({ running: false, lastExitReason: `fatal: ${err instanceof Error ? err.message : String(err)}` }); } catch { /* ignore */ }
+  const summary = safeFailureSummary('fatal', err);
+  console.error(`[claude-to-im] ${summary}`);
+  try { writeStatus({ running: false, lastExitReason: summary }); } catch { /* ignore */ }
   process.exit(1);
 });

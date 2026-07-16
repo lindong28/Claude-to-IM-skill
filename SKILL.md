@@ -6,10 +6,10 @@ description: |
   or diagnosing the claude-to-im bridge daemon; forwarding Claude replies to a messaging
   app; any phrase like "claude-to-im", "bridge", "消息推送", "消息转发", "桥接",
   "连上飞书", "手机上看claude", "启动后台服务", "诊断", "查看日志", "配置".
-  Subcommands: setup, start, stop, status, logs, reconfigure, doctor.
+  Subcommands: setup, start, stop, status, logs, reconfigure, doctor, uninstall, remove.
   Do NOT use for: building standalone bots, webhook integrations, or coding with IM
   platform SDKs — those are regular programming tasks.
-argument-hint: "setup | start | stop | status | logs [N] | reconfigure | doctor"
+argument-hint: "setup | start | stop | status | logs [N] | reconfigure | doctor | uninstall | remove"
 allowed-tools:
   - Bash
   - Read
@@ -23,11 +23,18 @@ allowed-tools:
 # Claude-to-IM Bridge Skill
 
 You are managing the Claude-to-IM bridge.
-User data is stored at `~/.claude-to-im/`.
-
 The skill directory (SKILL_DIR) is at `~/.claude/skills/claude-to-im`.
 In Codex installs it may instead be `~/.codex/skills/Claude-to-IM-skill`.
 If neither path exists, fall back to Glob with pattern `**/skills/**/claude-to-im/SKILL.md` or `**/skills/**/Claude-to-IM-skill/SKILL.md` and derive the root from the result.
+
+Resolve one instance identity before reading or writing config and bind it as `INSTANCE`. Use `default` unless the user names an instance; this plan uses `INSTANCE=quant-lab`. A named instance maps to home `~/.claude-to-im-$INSTANCE`, launchd label `com.claude-to-im.bridge.$INSTANCE`, and an independent config/store/log/runtime tree. Keep that variable unchanged for every setup, lifecycle, and doctor command:
+
+```bash
+CTI_INSTANCE="$INSTANCE" bash "$SKILL_DIR/scripts/daemon.sh" <start|stop|status|logs|uninstall|remove>
+CTI_INSTANCE="$INSTANCE" bash "$SKILL_DIR/scripts/doctor.sh"
+```
+
+Never omit `CTI_INSTANCE` midway through a named workflow: omission targets the protected default instance.
 
 ## Command parsing
 
@@ -42,6 +49,8 @@ Parse the user's intent from `$ARGUMENTS` into one of these subcommands:
 | `logs`, `logs 200`, `查看日志`, `查看日志 200` | logs |
 | `reconfigure`, `修改配置`, `帮我改一下 token`, `换个 bot` | reconfigure |
 | `doctor`, `diagnose`, `诊断`, `挂了`, `没反应了`, `bot 没反应`, `出问题了` | doctor |
+| `uninstall`, `卸载服务`, `取消自启` | uninstall |
+| `remove`, `删除实例` | remove |
 
 **Disambiguation: `status` vs `doctor`** — Use `status` when the user just wants to check if the bridge is running (informational). Use `doctor` when the user reports a problem or suspects something is broken (diagnostic). When in doubt and the user describes a symptom (e.g., "没反应了", "挂了"), prefer `doctor`.
 
@@ -54,17 +63,17 @@ Before asking users for any platform credentials, read `SKILL_DIR/references/set
 Before executing any subcommand, detect which environment you are running in:
 
 1. **Claude Code** — `AskUserQuestion` tool is available. Use it for interactive setup wizards.
-2. **Codex / other** — `AskUserQuestion` is NOT available. Fall back to non-interactive guidance: explain the steps, show `SKILL_DIR/config.env.example`, and ask the user to create `~/.claude-to-im/config.env` manually.
+2. **Codex / other** — `AskUserQuestion` is NOT available. Fall back to non-interactive guidance: explain the steps, show `SKILL_DIR/config.env.example`, and ask the user to create the config in the resolved instance home manually.
 
 You can test this by checking if AskUserQuestion is in your available tools list.
 
-## Config check (applies to `start`, `stop`, `status`, `logs`, `reconfigure`, `doctor`)
+## Config check (applies to `start`, `status`, `logs`, `reconfigure`, `doctor`)
 
-Before running any subcommand other than `setup`, check if `~/.claude-to-im/config.env` exists:
+Check the resolved instance home, not hardcoded default paths. The default config is `~/.claude-to-im/config.env`; named config is `~/.claude-to-im-<instance>/config.env`.
 
 - **If it does NOT exist:**
   - In Claude Code: tell the user "No configuration found" and automatically start the `setup` wizard using AskUserQuestion.
-  - In Codex: tell the user "No configuration found. Please create `~/.claude-to-im/config.env` based on the example:" then show the contents of `SKILL_DIR/config.env.example` and stop. Don't attempt to start the daemon — without config.env the process will crash on startup and leave behind a stale PID file that blocks future starts.
+  - In Codex: tell the user which resolved config path is missing, show `SKILL_DIR/config.env.example`, and stop. Do not attempt start without config.
 - **If it exists:** proceed with the requested subcommand.
 
 ## Subcommands
@@ -90,9 +99,9 @@ For each enabled channel, collect one credential at a time. Tell the user where 
 
 - **Telegram**: Bot Token → confirm (masked) → Chat ID (see guide for how to get it) → confirm → Allowed User IDs (optional). **Important:** At least one of Chat ID or Allowed User IDs must be set, otherwise the bot will reject all messages.
 - **Discord**: Bot Token → confirm (masked) → Allowed User IDs → Allowed Channel IDs (optional) → Allowed Guild IDs (optional). **Important:** At least one of Allowed User IDs or Allowed Channel IDs must be set, otherwise the bot will reject all messages (default-deny).
-- **Feishu**: App ID → confirm → App Secret → confirm (masked) → Domain (optional) → Allowed User IDs (optional). After collecting credentials, explain the two-phase setup the user must complete:
+- **Feishu**: App ID → confirm → App Secret → confirm (masked) → Domain (optional) → Allowed User IDs → Allowed Group IDs → Require Mention. For a named group bot, require non-empty user and group allowlists, `CTI_FEISHU_GROUP_POLICY=allowlist`, and `CTI_FEISHU_REQUIRE_MENTION=true`. Explain how to verify both opaque IDs from an inbound event without pasting them into logs or chat. Then explain the two-phase setup:
   - **Phase 1** (before starting bridge): (A) batch-add permissions, (B) enable bot capability, (C) publish first version + admin approve. This makes permissions and bot effective.
-  - **Phase 2** (requires running bridge): (D) run `/claude-to-im start`, (E) configure events (`im.message.receive_v1`) and callback (`card.action.trigger`) with long connection mode, (F) publish second version + admin approve.
+  - **Phase 2** (requires running bridge): (D) start the same instance, (E) configure `im.message.receive_v1` with long connection mode, (F) publish second version + admin approve. Add `card.action.trigger` only when the selected runtime can actually produce interactive approval cards; a Codex instance with `CTI_CODEX_APPROVAL_POLICY=never` does not need it.
   - **Why two phases:** Feishu validates WebSocket connection when saving event subscription — if the bridge isn't running, saving will fail. The bridge needs published permissions to connect.
   - Keep this to a short checklist — show the full guide only if asked.
 - **QQ**: Collect two required fields, then optional ones:
@@ -117,7 +126,7 @@ For each enabled channel, collect one credential at a time. Tell the user where 
 Ask for runtime, default working directory, model, and mode:
 - **Runtime**: `claude` (default), `codex`, `auto`
   - `claude` — uses Claude Code CLI + Claude Agent SDK (requires `claude` CLI installed)
-  - `codex` — uses OpenAI Codex SDK (requires `codex` CLI; auth via `codex auth login` or `OPENAI_API_KEY`)
+  - `codex` — uses OpenAI Codex SDK (requires `codex` CLI; auth via `codex login` or `OPENAI_API_KEY`)
   - `auto` — tries Claude first, falls back to Codex if Claude CLI not found
 - **Working Directory**: default `$CWD`
 - **Model** (optional): Leave blank to inherit the runtime's own default model. If the user wants to override, ask them to enter a model name. Do NOT hardcode or suggest specific model names — the available models change over time.
@@ -127,51 +136,58 @@ Ask for runtime, default working directory, model, and mode:
 
 1. Show a final summary table with all settings (secrets masked to last 4 chars)
 2. Ask user to confirm before writing
-3. Use Bash to create directory structure: `mkdir -p ~/.claude-to-im/{data,logs,runtime,data/messages}`
-4. Use Write to create `~/.claude-to-im/config.env` with all settings in KEY=VALUE format
-5. Use Bash to set permissions: `chmod 600 ~/.claude-to-im/config.env`
+3. Create the resolved instance home and `{data,logs,runtime,data/messages}` directories with mode `0700`
+4. Write `config.env` in that home, never in a different instance's home
+5. Set `config.env` mode to `0600`
 6. Validate tokens — read `SKILL_DIR/references/token-validation.md` for the exact commands and expected responses for each platform. This catches typos and wrong credentials before the user tries to start the daemon. For Weixin, a successful QR login already counts as validation.
 7. Report results with a summary table. If any validation fails, explain what might be wrong and how to fix it.
-8. On success, tell the user: "Setup complete! Run `/claude-to-im start` to start the bridge."
+8. On success, show the exact same-instance start and doctor commands
+
+For a named Feishu/Codex fixed instance, write these explicit policy keys and leave `CTI_DEFAULT_MODEL` unset:
+
+```dotenv
+CTI_SESSION_POLICY=fixed-confirm-recovery
+CTI_CODEX_SANDBOX_MODE=workspace-write
+CTI_CODEX_APPROVAL_POLICY=never
+CTI_CODEX_NETWORK_ACCESS=true
+```
 
 ### `start`
 
-**Pre-check:** Verify `~/.claude-to-im/config.env` exists (see "Config check" above). Without it, the daemon will crash immediately and leave a stale PID file.
-
-Run: `bash "SKILL_DIR/scripts/daemon.sh" start`
+Run the resolved identity: `CTI_INSTANCE="$INSTANCE" bash "$SKILL_DIR/scripts/daemon.sh" start`.
 
 Show the output to the user. If it fails, tell the user:
-- Run `doctor` to diagnose: `/claude-to-im doctor`
-- Check recent logs: `/claude-to-im logs`
+- Run same-instance doctor: `CTI_INSTANCE="$INSTANCE" bash "$SKILL_DIR/scripts/doctor.sh"`
+- Check same-instance logs: `CTI_INSTANCE="$INSTANCE" bash "$SKILL_DIR/scripts/daemon.sh" logs`
 
 ### `stop`
 
-Run: `bash "SKILL_DIR/scripts/daemon.sh" stop`
+Run: `CTI_INSTANCE="$INSTANCE" bash "$SKILL_DIR/scripts/daemon.sh" stop`. This stops/boots out the process but preserves its plist and home for a later start.
 
 ### `status`
 
-Run: `bash "SKILL_DIR/scripts/daemon.sh" status`
+Run: `CTI_INSTANCE="$INSTANCE" bash "$SKILL_DIR/scripts/daemon.sh" status`.
 
 ### `logs`
 
 Extract optional line count N from arguments (default 50).
-Run: `bash "SKILL_DIR/scripts/daemon.sh" logs N`
+Run: `CTI_INSTANCE="$INSTANCE" bash "$SKILL_DIR/scripts/daemon.sh" logs N`.
 
 ### `reconfigure`
 
-1. Read current config from `~/.claude-to-im/config.env`
+1. Read current config from the resolved instance home
 2. Show current settings in a clear table format, with all secrets masked (only last 4 chars visible)
 3. Use AskUserQuestion to ask what the user wants to change
 4. When collecting new values, tell the user where to find the value; only show the full guide from `SKILL_DIR/references/setup-guides.md` if they ask for help
 5. Update the config file atomically (write to tmp, rename)
 6. Re-validate any changed tokens
-7. Remind user: "Run `/claude-to-im stop` then `/claude-to-im start` to apply the changes."
+7. Remind the user to stop/start the same instance to apply changes
 
 If the user wants to switch Weixin accounts during `reconfigure`, run `cd SKILL_DIR && npm run weixin:login` again. Each successful scan replaces the previously linked local account.
 
 ### `doctor`
 
-Run: `bash "SKILL_DIR/scripts/doctor.sh"`
+Run: `CTI_INSTANCE="$INSTANCE" bash "$SKILL_DIR/scripts/doctor.sh"` for the same named instance.
 
 Show results and suggest fixes for any failures. Common fixes:
 - SDK cli.js missing → `cd SKILL_DIR && npm install`
@@ -182,11 +198,16 @@ Show results and suggest fixes for any failures. Common fixes:
 
 For more complex issues (messages not received, permission timeouts, high memory, stale PID files), read `SKILL_DIR/references/troubleshooting.md` for detailed diagnosis steps.
 
-**Feishu upgrade note:** If the user upgraded from an older version of this skill and Feishu is returning permission errors (e.g. streaming cards not working, typing indicators failing, permission buttons unresponsive), the root cause is almost certainly missing permissions or callbacks in the Feishu backend. Refer the user to the "Upgrading from a previous version" section in `SKILL_DIR/references/setup-guides.md` — they need to add new scopes (`cardkit:card:write`, `cardkit:card:read`, `im:message:update`, `im:message.reactions:read`, `im:message.reactions:write_only`), add the `card.action.trigger` callback, and re-publish the app. The upgrade requires two publish cycles because adding the callback needs an active WebSocket connection (bridge must be running).
+### `uninstall` and `remove`
+
+- `CTI_INSTANCE="$INSTANCE" bash "$SKILL_DIR/scripts/daemon.sh" uninstall` stops/unregisters the LaunchAgent but preserves the entire instance home and store.
+- `CTI_INSTANCE="$INSTANCE" bash "$SKILL_DIR/scripts/daemon.sh" remove "$INSTANCE"` deletes that home only after it is stopped and unregistered. The confirmation must exactly match the instance. `remove` refuses `default`.
+
+**Feishu upgrade note:** Read `references/setup-guides.md` before changing scopes/callbacks, then restart and diagnose with the already-bound `INSTANCE`. Keep two publish phases. Do not add `card.action.trigger` to a Codex/never instance merely because generic interactive runtimes use it.
 
 ## Notes
 
 - Always mask secrets in output (show only last 4 characters) — users often share terminal output in bug reports, so exposed tokens would be a security incident.
-- Always check for config.env before starting the daemon — without it the process crashes on startup and leaves a stale PID file that blocks future starts (requiring manual cleanup).
+- Always check for config.env before starting the daemon.
 - The daemon runs as a background Node.js process managed by platform supervisor (launchd on macOS, setsid on Linux, WinSW/NSSM on Windows).
-- Config persists at `~/.claude-to-im/config.env` — survives across sessions.
+- Config and store persist under the resolved instance home across sessions and ordinary stop/uninstall operations.

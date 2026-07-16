@@ -32,6 +32,11 @@ supervisor_stop() {
   rm -f "$PID_FILE"
 }
 
+supervisor_uninstall() {
+  # The Linux fallback has no persistent registration to remove.
+  supervisor_stop
+}
+
 supervisor_is_managed() {
   # Linux fallback has no service manager; always false
   return 1

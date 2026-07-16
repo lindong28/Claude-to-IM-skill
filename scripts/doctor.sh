@@ -1,12 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
-CTI_HOME="$HOME/.claude-to-im"
+SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=instance-env.sh
+source "$SKILL_DIR/scripts/instance-env.sh"
 CONFIG_FILE="$CTI_HOME/config.env"
 PID_FILE="$CTI_HOME/runtime/bridge.pid"
+STATUS_FILE="$CTI_HOME/runtime/status.json"
 LOG_FILE="$CTI_HOME/logs/bridge.log"
+PLIST_FILE="$HOME/Library/LaunchAgents/$CTI_LAUNCHD_LABEL.plist"
 
 PASS=0
 FAIL=0
+
+case "${1:-}" in
+  "") ;;
+  --repair-stale-lock) ;;
+  *)
+    echo "Usage: doctor.sh [--repair-stale-lock]" >&2
+    exit 64
+    ;;
+esac
+
+echo "Instance: $CTI_INSTANCE"
+echo "Home: $CTI_HOME"
+echo "Label: $CTI_LAUNCHD_LABEL"
+echo "Plist: $PLIST_FILE"
+echo ""
 
 check() {
   local label="$1"
@@ -19,6 +38,121 @@ check() {
     FAIL=$((FAIL + 1))
   fi
 }
+
+lifecycle_lock_path() {
+  local lock_key
+  lock_key=$(printf '%s' "$CTI_HOME_CANONICAL" | shasum -a 256 | awk '{print $1}')
+  printf '%s/.claude-to-im-lifecycle-locks/%s.lock\n' "$CTI_HOME_ROOT" "$lock_key"
+}
+
+stat_identity() {
+  stat -f '%d:%i' "$1" 2>/dev/null || stat -c '%d:%i' "$1" 2>/dev/null
+}
+
+repair_stale_lifecycle_lock() (
+  set -e
+  local lock_path lock_root lock_name expected_root expected_lock lock_identity owner_identity
+  local owner_pid owner_instance entry_count
+  lock_path=$(lifecycle_lock_path)
+  lock_root=$(dirname "$lock_path")
+  lock_name=$(basename "$lock_path")
+  expected_root="$lock_root"
+  expected_lock="$lock_path"
+
+  refuse_repair() {
+    echo "Refusing lifecycle-lock repair: lock path or owner changed during verification." >&2
+    exit 1
+  }
+
+  verify_pinned_lock() {
+    [ ! -L ./owner ] && [ -f ./owner ] || refuse_repair
+    entry_count=$(find . -mindepth 1 -maxdepth 1 -print 2>/dev/null | wc -l | tr -d ' ')
+    [ "$entry_count" = "1" ] || refuse_repair
+    owner_pid=$(sed -n '1p' ./owner 2>/dev/null || true)
+    owner_instance=$(sed -n '2p' ./owner 2>/dev/null || true)
+    [[ "$owner_pid" =~ ^[0-9]+$ ]] || refuse_repair
+    [ "$owner_instance" = "$CTI_INSTANCE" ] || refuse_repair
+    [ -z "$(sed -n '3p' ./owner 2>/dev/null || true)" ] || refuse_repair
+    if kill -0 "$owner_pid" 2>/dev/null; then
+      echo "Refusing lifecycle-lock repair: owner PID is still active." >&2
+      exit 1
+    fi
+  }
+
+  [ ! -L "$lock_root" ] && [ -d "$lock_root" ] || refuse_repair
+  cd -P "$lock_root"
+  [ "$(pwd -P)" = "$expected_root" ] || refuse_repair
+  [ ! -L "$lock_name" ] && [ -d "$lock_name" ] || refuse_repair
+  cd -P "$lock_name"
+  [ "$(pwd -P)" = "$expected_lock" ] || refuse_repair
+  lock_identity=$(stat_identity .) || refuse_repair
+  verify_pinned_lock
+  owner_identity=$(stat_identity ./owner) || refuse_repair
+
+  # Revalidate the pinned directory and owner immediately before deletion.
+  [ "$(stat_identity .)" = "$lock_identity" ] || refuse_repair
+  verify_pinned_lock
+  [ "$(stat_identity ./owner)" = "$owner_identity" ] || refuse_repair
+
+  # Relative deletion is anchored to the already-open physical cwd. A swap of
+  # the external lock path cannot redirect this operation through a symlink.
+  rm -- ./owner
+  cd -P ..
+
+  # rmdir never follows symlinks; require the external entry to still be the
+  # exact directory verified above before removing it.
+  [ ! -L "$lock_name" ] && [ -d "$lock_name" ] || refuse_repair
+  [ "$(stat_identity "$lock_name")" = "$lock_identity" ] || refuse_repair
+  rmdir -- "$lock_name"
+)
+
+inspect_lifecycle_lock() {
+  local lock_path="$1"
+  local lock_root
+  lock_root=$(dirname "$lock_path")
+  CTI_LOCK_STATE="absent"
+  CTI_LOCK_OWNER_PID=""
+  CTI_LOCK_OWNER_INSTANCE=""
+
+  if [ -L "$lock_root" ] || { [ -e "$lock_root" ] && [ ! -d "$lock_root" ]; }; then
+    CTI_LOCK_STATE="unsafe"
+    return 0
+  fi
+  [ -e "$lock_path" ] || [ -L "$lock_path" ] || return 0
+  if [ -L "$lock_path" ] || [ ! -d "$lock_path" ] || \
+     [ -L "$lock_path/owner" ] || [ ! -f "$lock_path/owner" ]; then
+    CTI_LOCK_STATE="unsafe"
+    return 0
+  fi
+  if [ "$(find "$lock_path" -mindepth 1 -maxdepth 1 -print 2>/dev/null | wc -l | tr -d ' ')" != "1" ]; then
+    CTI_LOCK_STATE="unsafe"
+    return 0
+  fi
+
+  CTI_LOCK_OWNER_PID=$(sed -n '1p' "$lock_path/owner" 2>/dev/null || true)
+  CTI_LOCK_OWNER_INSTANCE=$(sed -n '2p' "$lock_path/owner" 2>/dev/null || true)
+  if ! [[ "$CTI_LOCK_OWNER_PID" =~ ^[0-9]+$ ]] || \
+     [ "$CTI_LOCK_OWNER_INSTANCE" != "$CTI_INSTANCE" ] || \
+     [ -n "$(sed -n '3p' "$lock_path/owner" 2>/dev/null || true)" ]; then
+    CTI_LOCK_STATE="unsafe"
+  elif kill -0 "$CTI_LOCK_OWNER_PID" 2>/dev/null; then
+    CTI_LOCK_STATE="active"
+  else
+    CTI_LOCK_STATE="stale"
+  fi
+}
+
+LIFECYCLE_LOCK_PATH=$(lifecycle_lock_path)
+inspect_lifecycle_lock "$LIFECYCLE_LOCK_PATH"
+if [ "${1:-}" = "--repair-stale-lock" ]; then
+  if [ "$CTI_LOCK_STATE" != "stale" ]; then
+    echo "Refusing lifecycle-lock repair: state is $CTI_LOCK_STATE (expected stale)." >&2
+    exit 1
+  fi
+  repair_stale_lifecycle_lock
+  echo "Removed verified stale lifecycle lock for instance $CTI_INSTANCE."
+  exit 0
+fi
 
 # --- Node.js version ---
 if command -v node &>/dev/null; then
@@ -33,10 +167,12 @@ else
 fi
 
 # --- Helper: read a value from config.env ---
-get_config() { grep "^$1=" "$CONFIG_FILE" 2>/dev/null | head -1 | cut -d= -f2- | sed 's/^["'"'"']//;s/["'"'"']$//'; }
+get_config() {
+  { grep "^$1=" "$CONFIG_FILE" 2>/dev/null || true; } \
+    | head -1 | cut -d= -f2- | sed 's/^["'"'"']//;s/["'"'"']$//'
+}
 
 # --- Read runtime setting ---
-SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 CTI_RUNTIME=$(get_config CTI_RUNTIME)
 CTI_RUNTIME="${CTI_RUNTIME:-claude}"
 echo "Runtime: $CTI_RUNTIME"
@@ -167,29 +303,13 @@ if [ "$CTI_RUNTIME" = "claude" ] || [ "$CTI_RUNTIME" = "auto" ]; then
   if [ "$HAS_ANTHROPIC_CONFIG" = "true" ]; then
     check "ANTHROPIC_* vars in config.env (third-party API provider)" 0
 
-    PLIST_FILE="$HOME/Library/LaunchAgents/com.claude-to-im.bridge.plist"
-
-    # On macOS, verify the launchd plist also has the vars
+    # Credentials must be loaded from config.env by the process, never copied
+    # into a launchd plist.
     if [ "$(uname -s)" = "Darwin" ] && [ -f "$PLIST_FILE" ]; then
       if grep -q "ANTHROPIC_" "$PLIST_FILE" 2>/dev/null; then
-        check "ANTHROPIC_* vars in launchd plist" 0
+        check "ANTHROPIC_* vars absent from launchd plist" 1
       else
-        check "ANTHROPIC_* vars in launchd plist (NOT present — restart bridge to regenerate plist)" 1
-      fi
-    fi
-
-    # If bridge is running, verify the LIVE process has the vars.
-    # The plist may be correct on disk but if the daemon hasn't been
-    # restarted since the plist was regenerated, it still runs with the
-    # old environment.
-    BRIDGE_PID=$(cat "$PID_FILE" 2>/dev/null || true)
-    if [ -n "$BRIDGE_PID" ] && kill -0 "$BRIDGE_PID" 2>/dev/null; then
-      # ps eww shows the process environment on macOS/Linux
-      PROC_ENV=$(ps eww -p "$BRIDGE_PID" 2>/dev/null || true)
-      if echo "$PROC_ENV" | grep -q "ANTHROPIC_"; then
-        check "Running bridge process has ANTHROPIC_* env vars" 0
-      else
-        check "Running bridge process has ANTHROPIC_* env vars (NOT in process env — restart the bridge)" 1
+        check "ANTHROPIC_* vars absent from launchd plist" 0
       fi
     fi
   else
@@ -217,8 +337,73 @@ if [ "$CTI_RUNTIME" = "claude" ] || [ "$CTI_RUNTIME" = "auto" ]; then
   fi
 fi
 
+# --- Named-instance private persistence boundary ---
+if [ "$CTI_INSTANCE" != "default" ]; then
+  HOME_PERMS=$(stat -f "%Lp" "$CTI_HOME" 2>/dev/null || stat -c "%a" "$CTI_HOME" 2>/dev/null || echo "missing")
+  if [ "$HOME_PERMS" = "700" ]; then
+    check "Named instance home permissions are 700" 0
+  else
+    check "Named instance home permissions are 700 (currently $HOME_PERMS)" 1
+  fi
+
+  BAD_DIRS=""
+  BAD_FILES=""
+  for dir in "$CTI_HOME/data" "$CTI_HOME/runtime" "$CTI_HOME/logs"; do
+    [ ! -d "$dir" ] || BAD_DIRS+="$(find "$dir" -type d ! -perm 700 -print 2>/dev/null)"
+    [ ! -d "$dir" ] || BAD_FILES+="$(find "$dir" -type f ! -perm 600 -print 2>/dev/null)"
+  done
+  if [ -z "$BAD_DIRS" ]; then
+    check "Named data/runtime/log directories are 700" 0
+  else
+    check "Named data/runtime/log directories are 700" 1
+  fi
+  if [ -z "$BAD_FILES" ]; then
+    check "Named data/runtime/log files are 600" 0
+  else
+    check "Named data/runtime/log files are 600" 1
+  fi
+fi
+
+# --- Lifecycle operation lock ---
+case "$CTI_LOCK_STATE" in
+  absent)
+    check "Lifecycle operation lock is clear" 0
+    ;;
+  active)
+    check "Lifecycle operation lock is clear (operation owned by live PID $CTI_LOCK_OWNER_PID)" 1
+    ;;
+  stale)
+    check "Lifecycle operation lock is clear (verified stale lock; repair with: CTI_INSTANCE=$CTI_INSTANCE bash '$SKILL_DIR/scripts/doctor.sh' --repair-stale-lock)" 1
+    ;;
+  *)
+    check "Lifecycle operation lock is structurally safe (manual inspection required; automatic repair refused)" 1
+    ;;
+esac
+
 # --- Codex checks (codex/auto modes) ---
 if [ "$CTI_RUNTIME" = "codex" ] || [ "$CTI_RUNTIME" = "auto" ]; then
+  CODEX_SANDBOX_POLICY=$(get_config CTI_CODEX_SANDBOX_MODE)
+  CODEX_APPROVAL_POLICY=$(get_config CTI_CODEX_APPROVAL_POLICY)
+  CODEX_NETWORK_POLICY=$(get_config CTI_CODEX_NETWORK_ACCESS)
+  CODEX_POLICY_CONFIG_VALID=0
+  case "$CODEX_SANDBOX_POLICY" in
+    "") CODEX_SANDBOX_POLICY="inherited" ;;
+    read-only|workspace-write|danger-full-access) ;;
+    *) CODEX_SANDBOX_POLICY="invalid"; CODEX_POLICY_CONFIG_VALID=1 ;;
+  esac
+  case "$CODEX_APPROVAL_POLICY" in
+    "") CODEX_APPROVAL_POLICY="derived-from-permission-mode" ;;
+    untrusted|on-failure|on-request|never) ;;
+    *) CODEX_APPROVAL_POLICY="invalid"; CODEX_POLICY_CONFIG_VALID=1 ;;
+  esac
+  case "$CODEX_NETWORK_POLICY" in
+    "") CODEX_NETWORK_POLICY="inherited" ;;
+    true|false) ;;
+    *) CODEX_NETWORK_POLICY="invalid"; CODEX_POLICY_CONFIG_VALID=1 ;;
+  esac
+  echo "Codex effective policy: sandbox=$CODEX_SANDBOX_POLICY, approval=$CODEX_APPROVAL_POLICY, network=$CODEX_NETWORK_POLICY"
+  check "Codex execution policy config values are valid" "$CODEX_POLICY_CONFIG_VALID"
+
   if command -v codex &>/dev/null; then
     CODEX_VER=$(codex --version 2>/dev/null || echo "unknown")
     check "Codex CLI available (${CODEX_VER})" 0
@@ -242,14 +427,17 @@ if [ "$CTI_RUNTIME" = "codex" ] || [ "$CTI_RUNTIME" = "auto" ]; then
     fi
   fi
 
-  # Check Codex auth: any of CTI_CODEX_API_KEY / CODEX_API_KEY / OPENAI_API_KEY,
-  # or `codex auth status` showing logged-in (interactive login).
+  # Check Codex auth: any configured API key, or `codex login status`
+  # showing logged-in (interactive login).
   CODEX_AUTH=1
-  if [ -n "${CTI_CODEX_API_KEY:-}" ] || [ -n "${CODEX_API_KEY:-}" ] || [ -n "${OPENAI_API_KEY:-}" ]; then
+  if [ -n "$(get_config CTI_CODEX_API_KEY)" ] || [ -n "$(get_config CODEX_API_KEY)" ] || \
+     [ -n "$(get_config OPENAI_API_KEY)" ] || [ -n "${CTI_CODEX_API_KEY:-}" ] || \
+     [ -n "${CODEX_API_KEY:-}" ] || [ -n "${OPENAI_API_KEY:-}" ]; then
     CODEX_AUTH=0
   elif command -v codex &>/dev/null; then
-    CODEX_AUTH_OUT=$(codex auth status 2>&1 || true)
-    if echo "$CODEX_AUTH_OUT" | grep -qiE 'logged.in|authenticated'; then
+    CODEX_AUTH_OUT=$(codex login status 2>&1 || true)
+    if echo "$CODEX_AUTH_OUT" | grep -qiE 'logged in|authenticated' && \
+       ! echo "$CODEX_AUTH_OUT" | grep -qiE 'not logged in|unauthenticated'; then
       CODEX_AUTH=0
     fi
   fi
@@ -257,7 +445,7 @@ if [ "$CTI_RUNTIME" = "codex" ] || [ "$CTI_RUNTIME" = "auto" ]; then
     check "Codex auth available (API key or login)" 0
   else
     if [ "$CTI_RUNTIME" = "codex" ]; then
-      check "Codex auth available (set OPENAI_API_KEY or run 'codex auth login')" 1
+      check "Codex auth available (set OPENAI_API_KEY or run 'codex login')" 1
     else
       check "Codex auth available (not found — needed only for Codex fallback)" 0
     fi
@@ -319,6 +507,50 @@ if [ -f "$CONFIG_FILE" ]; then
     FS_SECRET=$(get_config CTI_FEISHU_APP_SECRET)
     FS_DOMAIN=$(get_config CTI_FEISHU_DOMAIN)
     FS_DOMAIN="${FS_DOMAIN:-https://open.feishu.cn}"
+    FS_GROUP_POLICY=$(get_config CTI_FEISHU_GROUP_POLICY)
+    FS_REQUIRE_MENTION=$(get_config CTI_FEISHU_REQUIRE_MENTION)
+    FS_ALLOWED_USERS=$(get_config CTI_FEISHU_ALLOWED_USERS)
+    FS_ALLOWED_GROUPS=$(get_config CTI_FEISHU_GROUP_ALLOW_FROM)
+
+    if [ "$CTI_INSTANCE" != "default" ]; then
+    if [ "$FS_GROUP_POLICY" = "allowlist" ]; then
+      check "Feishu group policy is allowlist" 0
+    else
+      check "Feishu group policy is allowlist" 1
+    fi
+    FS_USER_COUNT=$(printf '%s' "$FS_ALLOWED_USERS" | awk -F, '{n=0; for(i=1;i<=NF;i++) if($i!="") n++; print n}')
+    FS_GROUP_COUNT=$(printf '%s' "$FS_ALLOWED_GROUPS" | awk -F, '{n=0; for(i=1;i<=NF;i++) if($i!="") n++; print n}')
+    if [ "$FS_USER_COUNT" -gt 0 ] 2>/dev/null; then
+      check "Feishu allowed users configured (count: $FS_USER_COUNT)" 0
+    else
+      check "Feishu allowed users configured (count: 0)" 1
+    fi
+    if [ "$FS_GROUP_COUNT" -gt 0 ] 2>/dev/null; then
+      check "Feishu allowed groups configured (count: $FS_GROUP_COUNT)" 0
+    else
+      check "Feishu allowed groups configured (count: 0)" 1
+    fi
+    if [ "$FS_REQUIRE_MENTION" = "true" ]; then
+      check "Feishu require mention is true" 0
+    else
+      check "Feishu require mention is true" 1
+    fi
+
+    PLIST_SENSITIVE=0
+    if [ -f "$PLIST_FILE" ]; then
+      if grep -qE 'CTI_FEISHU_APP_SECRET|CTI_FEISHU_ALLOWED_USERS|CTI_FEISHU_GROUP_ALLOW_FROM' "$PLIST_FILE" 2>/dev/null; then
+        PLIST_SENSITIVE=1
+      fi
+      for value in "$FS_SECRET" ${FS_ALLOWED_USERS//,/ } ${FS_ALLOWED_GROUPS//,/ }; do
+        [ -z "$value" ] || ! grep -Fq -- "$value" "$PLIST_FILE" 2>/dev/null || PLIST_SENSITIVE=1
+      done
+    fi
+    if [ "$PLIST_SENSITIVE" -eq 0 ]; then
+      check "Named plist excludes Feishu sensitive keys and values" 0
+    else
+      check "Named plist excludes Feishu sensitive keys and values" 1
+    fi
+    fi
     if [ -n "$FS_APP_ID" ] && [ -n "$FS_SECRET" ]; then
       FEISHU_RESULT=$(curl -s --max-time 5 -X POST "${FS_DOMAIN}/open-apis/auth/v3/tenant_access_token/internal" \
         -H "Content-Type: application/json" \
@@ -402,6 +634,72 @@ if [ -f "$CONFIG_FILE" ]; then
   fi
 fi
 
+# --- Named Feishu+Codex external health (state/timestamps only; never render raw payloads) ---
+if [ "$CTI_INSTANCE" != "default" ] \
+  && [[ ",$(get_config CTI_ENABLED_CHANNELS)," == *,feishu,* ]] \
+  && [ "$CTI_RUNTIME" = "codex" ]; then
+  EXTERNAL_HEALTH_FILE="$CTI_HOME/runtime/external-health.json"
+  if [ -f "$EXTERNAL_HEALTH_FILE" ] && [ -f "$STATUS_FILE" ]; then
+  HEALTH_SUMMARY=$(node -e '
+    const fs = require("fs");
+    try {
+      const s = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      const runtime = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+      const f = s && typeof s.feishu === "object" ? s.feishu : {};
+      const c = s && typeof s.codex === "object" ? s.codex : {};
+      const clean = (v) => typeof v === "string" && /^[0-9TZ:.+-]+$/.test(v) ? v : "";
+      const started = clean(runtime.startedAt);
+      const fresh = (v) => { const value = clean(v); return started && value >= started ? value : ""; };
+      const connection = f.connection === "connected" && fresh(f.lastConnectedAt) ? "connected" : "unknown";
+      const disconnected = fresh(f.lastDisconnectedAt);
+      const success = fresh(c.lastSuccessAt);
+      const error = fresh(c.lastErrorAt);
+      const codexState = success && (!error || success >= error) ? "success" : (error ? "error" : "unknown");
+      const pid = Number.isInteger(runtime.pid) && runtime.pid > 0 ? String(runtime.pid) : "";
+      process.stdout.write([runtime.running === true ? "true" : "false", pid, connection, fresh(f.lastConnectedAt), disconnected, fresh(f.lastAcceptedInboundAt), codexState, success, error].join("|"));
+    } catch { process.stdout.write("false||invalid||||||"); }
+  ' "$EXTERNAL_HEALTH_FILE" "$STATUS_FILE")
+  IFS='|' read -r HEALTH_RUNNING HEALTH_PID HEALTH_CONNECTION HEALTH_CONNECTED_AT HEALTH_DISCONNECTED_AT HEALTH_INBOUND_AT HEALTH_CODEX_STATE HEALTH_CODEX_SUCCESS_AT HEALTH_CODEX_ERROR_AT <<< "$HEALTH_SUMMARY"
+  HEALTH_PROCESS_CURRENT=false
+  if [ "$HEALTH_RUNNING" = "true" ] && [[ "$HEALTH_PID" =~ ^[0-9]+$ ]] && kill -0 "$HEALTH_PID" 2>/dev/null; then
+    HEALTH_PROCESS_CURRENT=true
+  fi
+  if [ "$HEALTH_PROCESS_CURRENT" = "true" ] && [ "$HEALTH_CONNECTION" = "connected" ] && [ -n "$HEALTH_CONNECTED_AT" ]; then
+    check "Feishu external connection connected ($HEALTH_CONNECTED_AT)" 0
+    if [ -n "$HEALTH_DISCONNECTED_AT" ]; then
+      echo "Feishu previous disconnect in current run ($HEALTH_DISCONNECTED_AT)"
+    fi
+  elif [ "$HEALTH_CONNECTION" = "connected" ] && [ -n "$HEALTH_CONNECTED_AT" ]; then
+    check "Feishu external connection not current (last connected $HEALTH_CONNECTED_AT)" 1
+  elif [ -n "$HEALTH_DISCONNECTED_AT" ]; then
+    check "Feishu external connection disconnected ($HEALTH_DISCONNECTED_AT)" 1
+  else
+    check "Feishu external connection connected" 1
+  fi
+  if [ "$HEALTH_PROCESS_CURRENT" = "true" ] && [ -n "$HEALTH_INBOUND_AT" ]; then
+    check "Feishu accepted inbound observed ($HEALTH_INBOUND_AT)" 0
+  elif [ -n "$HEALTH_INBOUND_AT" ]; then
+    check "Feishu accepted inbound not current (last observed $HEALTH_INBOUND_AT)" 1
+  else
+    check "Feishu accepted inbound observed" 1
+  fi
+  if [ "$HEALTH_PROCESS_CURRENT" = "true" ] && [ "$HEALTH_CODEX_STATE" = "success" ] && [ -n "$HEALTH_CODEX_SUCCESS_AT" ]; then
+    check "Codex provider success observed ($HEALTH_CODEX_SUCCESS_AT)" 0
+    if [ -n "$HEALTH_CODEX_ERROR_AT" ]; then
+      echo "Codex previous provider error in current run ($HEALTH_CODEX_ERROR_AT)"
+    fi
+  elif [ "$HEALTH_CODEX_STATE" = "error" ] && [ -n "$HEALTH_CODEX_ERROR_AT" ]; then
+    check "Codex provider error observed ($HEALTH_CODEX_ERROR_AT)" 1
+  elif [ -n "$HEALTH_CODEX_SUCCESS_AT" ]; then
+    check "Codex provider not current (last success $HEALTH_CODEX_SUCCESS_AT)" 1
+  else
+    check "Codex provider success observed" 1
+  fi
+  else
+    check "External health status available" 1
+  fi
+fi
+
 # --- Log directory writable ---
 LOG_DIR="$CTI_HOME/logs"
 if [ -d "$LOG_DIR" ] && [ -w "$LOG_DIR" ]; then
@@ -424,7 +722,10 @@ fi
 
 # --- Recent errors in log ---
 if [ -f "$LOG_FILE" ]; then
-  ERROR_COUNT=$(tail -50 "$LOG_FILE" | grep -ciE 'ERROR|Fatal' || true)
+  ERROR_COUNT=$(tail -50 "$LOG_FILE" \
+    | awk '/Starting bridge \(run_id:/ { lines = "" } { lines = lines $0 "\n" } END { printf "%s", lines }' \
+    | grep -vE '\(node:[0-9]+\) \[DEP[0-9]+\] DeprecationWarning:' \
+    | grep -ciE 'ERROR|Fatal' || true)
   if [ "$ERROR_COUNT" -eq 0 ]; then
     check "No recent errors in log (last 50 lines)" 0
   else
@@ -445,6 +746,7 @@ if [ "$FAIL" -gt 0 ]; then
   echo "  config.env missing    → run setup wizard"
   echo "  Weixin linked account missing→ cd $SKILL_DIR && npm run weixin:login"
   echo "  Stale PID file        → run stop, then start"
+  echo "  Stale lifecycle lock → follow the verified repair command printed above"
 fi
 
 [ "$FAIL" -eq 0 ] && exit 0 || exit 1
