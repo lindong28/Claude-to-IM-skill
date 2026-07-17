@@ -4,6 +4,15 @@
  * Assembles all DI implementations and starts the bridge.
  */
 
+// discord.js v14 checks process.versions for 'deno' or 'bun' to decide whether
+// to use globalThis.WebSocket (proxy-aware via --use-env-proxy) or the 'ws'
+// library (ignores HTTP_PROXY). Node.js 22+ has a stable built-in WebSocket, so
+// this shim is safe. Without it, the Discord Gateway connection bypasses the
+// proxy and times out in networks that require one.
+if (typeof globalThis.WebSocket !== 'undefined' && process.env.HTTP_PROXY) {
+  Object.defineProperty(process.versions, 'bun', { value: '1.0.0', configurable: true });
+}
+
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
