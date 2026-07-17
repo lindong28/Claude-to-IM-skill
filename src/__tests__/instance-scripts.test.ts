@@ -42,11 +42,12 @@ describe('instance-aware lifecycle scripts', () => {
       '#!/usr/bin/env bash\n' +
         'printf "%s\\n" "$*" >> "${CTI_TEST_LAUNCHCTL_LOG}"\n' +
         'state="$HOME/.cti-test-launchctl-managed"\n' +
+        'delay="$HOME/.cti-test-launchctl-delay"\n' +
         'case "${1:-}" in\n' +
-        '  print) [ -f "$state" ] || exit 1; printf "pid = 4242\\n" ;;\n' +
+        '  print) [ -f "$state" ] || exit 1; if [ -f "$delay" ]; then remaining=$(cat "$delay"); if [ "$remaining" -gt 0 ]; then printf "%s\\n" "$((remaining - 1))" > "$delay"; else rm -f "$delay" "$state"; exit 1; fi; fi; printf "pid = 4242\\n" ;;\n' +
         '  bootstrap) touch "$state"; [ -z "${CTI_TEST_BOOTSTRAP_WAIT:-}" ] || sleep "$CTI_TEST_BOOTSTRAP_WAIT"; if [ "${CTI_TEST_MUTATE_DEFAULT:-}" = 1 ]; then printf "mutated\\n" >> "$HOME/.claude-to-im/config.env"; fi ;;\n' +
         '  kickstart) mkdir -p "$CTI_HOME/runtime"; printf "4242" > "$CTI_HOME/runtime/bridge.pid"; printf "{\\"running\\":true}" > "$CTI_HOME/runtime/status.json" ;;\n' +
-        '  bootout) if [ "${CTI_TEST_BOOTOUT_FAIL:-}" = 1 ]; then exit 5; fi; rm -f "$state" ;;\n' +
+        '  bootout) if [ "${CTI_TEST_BOOTOUT_FAIL:-}" = 1 ]; then exit 5; fi; if [ -n "${CTI_TEST_BOOTOUT_DELAY_POLLS:-}" ]; then printf "%s\\n" "$CTI_TEST_BOOTOUT_DELAY_POLLS" > "$delay"; else rm -f "$state"; fi ;;\n' +
         'esac\n',
       { mode: 0o700 },
     );
@@ -244,6 +245,38 @@ describe('instance-aware lifecycle scripts', () => {
     assert.match(lowercasePlist, /<string>--use-env-proxy<\/string>/);
   });
 
+  it('rejects authenticated proxy URLs instead of persisting credentials in a plist', () => {
+    const namedHome = path.join(home, '.claude-to-im-quant-lab');
+    const plist = path.join(home, 'Library/LaunchAgents/com.claude-to-im.bridge.quant-lab.plist');
+    const command = [
+      'set -e',
+      'source scripts/instance-env.sh',
+      'SKILL_DIR="$PWD"',
+      'PID_FILE="$CTI_HOME/runtime/bridge.pid"',
+      'STATUS_FILE="$CTI_HOME/runtime/status.json"',
+      'LOG_FILE="$CTI_HOME/logs/bridge.log"',
+      'source scripts/supervisor-macos.sh',
+      'generate_plist',
+    ].join('; ');
+    fs.mkdirSync(namedHome, { recursive: true });
+
+    const result = spawnSync('/bin/bash', ['-c', command], {
+      cwd: SKILL_DIR,
+      env: {
+        ...process.env,
+        ...env,
+        CTI_INSTANCE: 'quant-lab',
+        HTTPS_PROXY: 'http://proxy-user:proxy-password@proxy.invalid:8080',
+      },
+      encoding: 'utf8',
+    });
+
+    assert.notEqual(result.status, 0);
+    assert.match(`${result.stdout}${result.stderr}`, /authenticated proxy.*not supported/i);
+    assert.equal(fs.existsSync(plist), false);
+    assert.doesNotMatch(`${result.stdout}${result.stderr}`, /proxy-user|proxy-password/);
+  });
+
   it('keeps status read-only, and reports the resolved identity', () => {
     const defaultHome = path.join(home, '.claude-to-im');
     const runtimeDir = path.join(defaultHome, 'runtime');
@@ -392,6 +425,23 @@ describe('instance-aware lifecycle scripts', () => {
     assert.notEqual(result.status, 0);
     assert.equal(fs.existsSync(plist), true);
     assert.equal(fs.existsSync(path.join(namedHome, 'runtime', 'bridge.pid')), true);
+  });
+
+  it('waits for launchd to finish an asynchronous bootout', () => {
+    const namedHome = path.join(home, '.claude-to-im-quant-lab');
+    fs.mkdirSync(path.join(namedHome, 'runtime'), { recursive: true });
+    fs.writeFileSync(path.join(namedHome, '.cti-instance-owner'), 'quant-lab\n', { mode: 0o600 });
+    fs.writeFileSync(path.join(namedHome, 'runtime', 'bridge.pid'), '4242');
+    fs.writeFileSync(path.join(home, '.cti-test-launchctl-managed'), 'managed');
+
+    shell('bash scripts/daemon.sh stop', {
+      ...env,
+      CTI_INSTANCE: 'quant-lab',
+      CTI_TEST_BOOTOUT_DELAY_POLLS: '2',
+    });
+
+    assert.equal(fs.existsSync(path.join(home, '.cti-test-launchctl-managed')), false);
+    assert.equal(fs.existsSync(path.join(namedHome, 'runtime', 'bridge.pid')), false);
   });
 
   it('serializes lifecycle operations by canonical home', async () => {

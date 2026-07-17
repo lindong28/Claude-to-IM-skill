@@ -2,9 +2,11 @@
 
 ## Credential Storage
 
-All credentials are stored in `~/.claude-to-im/config.env` with file permissions set to `600` (owner read/write only). This file is created during `setup` and never committed to version control.
+By default, credentials are stored in `~/.claude-to-im/config.env` with file permissions set to `600` (owner read/write only). This file is created during `setup` and never committed to the claude-to-im repository.
 
 The `.gitignore` excludes `config.env` to prevent accidental commits.
+
+An enclosing private deployment repository may explicitly opt into a path-scoped tracked canonical config outside this skill tree. That repository owns the accepted risk and must materialize the runtime copy with mode `0600`; credentials remain forbidden from logs, replies, plist files, and all paths outside the declared exception. Proxy variables may be forwarded to a plist only when their URL authority contains no userinfo; authenticated proxy URLs are rejected.
 
 ## Log Redaction
 

@@ -17,6 +17,17 @@ xml_escape() {
   printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
 }
 
+proxy_has_userinfo() {
+  local value="$1"
+  local authority
+  case "$value" in
+    *://*) authority="${value#*://}" ;;
+    *) authority="$value" ;;
+  esac
+  authority="${authority%%/*}"
+  [[ "$authority" == *@* ]]
+}
+
 # Collect env vars that should be forwarded into the plist.
 # We honour clean_env() logic by reading *after* clean_env runs.
 build_env_dict() {
@@ -27,6 +38,14 @@ build_env_dict() {
   for var in HOME PATH USER SHELL LANG TMPDIR HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
     local val="${!var:-}"
     [ -z "$val" ] && continue
+    case "$var" in
+      HTTP_PROXY|HTTPS_PROXY|http_proxy|https_proxy)
+        if proxy_has_userinfo "$val"; then
+          echo "Authenticated proxy URLs are not supported in LaunchAgent environments." >&2
+          return 64
+        fi
+        ;;
+    esac
     val=$(xml_escape "$val")
     dict+="${indent}<key>${var}</key>"
     dict+=$'\n'
@@ -132,10 +151,15 @@ supervisor_bootout_selected() {
 }
 
 supervisor_assert_selected_stopped() {
-  if supervisor_is_managed || supervisor_is_running; then
-    echo "Selected LaunchAgent $LAUNCHD_LABEL is still managed or running." >&2
-    return 1
-  fi
+  local _
+  for _ in $(seq 1 20); do
+    if ! supervisor_is_managed && ! supervisor_is_running; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "Selected LaunchAgent $LAUNCHD_LABEL is still managed or running." >&2
+  return 1
 }
 
 supervisor_start() {
