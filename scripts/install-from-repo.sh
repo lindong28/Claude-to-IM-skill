@@ -7,6 +7,7 @@ CTI_SKILL="$REPO_DIR/claude/skills/claude-to-im"
 CTI_CORE="$REPO_DIR/library/Claude-to-IM"
 CTI_PATCH="$REPO_DIR/library/claude-to-im.patch"
 UPDATE_EXISTING="${UPDATE_EXISTING:-0}"
+INSTALL_SERVICES="${INSTALL_SERVICES:-0}"
 CTI_DEPENDENCIES_CHANGED=0
 CTI_PATCH_CHANGED=0
 CTI_TRACKED_INSTANCES=()
@@ -290,8 +291,13 @@ converge_tracked_instance_services() {
     elif [ -e "$plist" ]; then
       echo "→ preserving stopped claude-to-im instance: $instance"
       continue
-    else
+    elif [ "$INSTALL_SERVICES" = "1" ]; then
       should_converge=1
+    else
+      # Service opt-in (§3.6): a never-installed instance deploys only on
+      # explicit opt-in; its config stays materialized for a later opt-in run.
+      echo "→ optional claude-to-im instance not installed: $instance (enable with INSTALL_SERVICES=1)"
+      continue
     fi
 
     [ "$should_converge" = "1" ] || continue

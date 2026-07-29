@@ -258,11 +258,22 @@ EOF
     || fail "tracked config was materialized before the bundle build succeeded"
   : > "$fake_repo/claude/skills/claude-to-im/dist/daemon.mjs"
 
+  # §3.6 opt-in: without INSTALL_SERVICES=1 a never-installed instance is
+  # materialized for later runs but not deployed.
+  : > "$log"
+  CTI_TEST_LOG="$log" CTI_TEST_SERVICE_STATE="$service_state" HOME="$sandbox/home" \
+    REPO_DIR="$fake_repo" PATH="$stub_bin:$PATH" bash "$INSTALLER"
+  [ -f "$target_config" ] || fail "opt-out run did not materialize the tracked config"
+  [ ! -e "$marker" ] || fail "opt-out run recorded a deployed marker"
+  [ ! -e "$sandbox/home/Library/LaunchAgents/com.claude-to-im.bridge.quant-lab.plist" ] \
+    || fail "opt-out run deployed the launchd instance"
+  [ ! -s "$log" ] || fail "opt-out run invoked the instance daemon"
+
   CTI_TEST_MUTATE_CONFIG_AFTER_COPY=1 \
     CTI_TEST_CANONICAL_CONFIG="$fake_repo/skill-configs/claude-to-im/instances/quant-lab/config.env" \
     CTI_TEST_CONFIG_MUTATED="$sandbox/config-mutated" \
     CTI_TEST_LOG="$log" CTI_TEST_SERVICE_STATE="$service_state" HOME="$sandbox/home" \
-    REPO_DIR="$fake_repo" PATH="$stub_bin:$PATH" bash "$INSTALLER"
+    REPO_DIR="$fake_repo" INSTALL_SERVICES=1 PATH="$stub_bin:$PATH" bash "$INSTALLER"
 
   [ -e "$sandbox/config-mutated" ] || fail "config snapshot race fixture did not mutate the canonical source"
   [ -f "$target_config" ] || fail "tracked named config was not materialized"
