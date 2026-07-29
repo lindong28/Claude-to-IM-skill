@@ -5,11 +5,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="${REPO_DIR:-$(cd "$SCRIPT_DIR/../../../.." && pwd)}"
 CTI_SKILL="$REPO_DIR/claude/skills/claude-to-im"
 CTI_CORE="$REPO_DIR/library/Claude-to-IM"
-CTI_PATCH="$REPO_DIR/library/claude-to-im.patch"
 UPDATE_EXISTING="${UPDATE_EXISTING:-0}"
 INSTALL_SERVICES="${INSTALL_SERVICES:-0}"
 CTI_DEPENDENCIES_CHANGED=0
-CTI_PATCH_CHANGED=0
 CTI_TRACKED_INSTANCES=()
 CTI_TRACKED_HOMES=()
 CTI_TRACKED_CONFIG_PENDING=()
@@ -28,8 +26,7 @@ needs_npm_install() {
 
 run_npm_install() {
   local dir="$1"
-  local force="${2:-0}"
-  if [ -d "$dir/node_modules" ] && [ "$UPDATE_EXISTING" != "1" ] && [ "$force" != "1" ]; then
+  if [ -d "$dir/node_modules" ] && [ "$UPDATE_EXISTING" != "1" ]; then
     return
   fi
   if needs_npm_install "$dir"; then
@@ -141,55 +138,6 @@ write_private_state() {
   printf '%s\n' "$value" > "$temp"
   chmod 600 "$temp"
   mv -f "$temp" "$path"
-}
-
-apply_component_patch() {
-  local target base_hash desired_hash current_hash
-  local absent_targets=""
-  local drifted_targets=""
-  local patch_targets="package.json package-lock.json src/main.ts"
-
-  for target in $patch_targets; do
-    read -r base_hash desired_hash < <(
-      awk -v marker="diff --git a/$target b/$target" '
-        $0 == marker { found = 1; next }
-        found && /^index / {
-          split($2, hashes, "\\.\\.")
-          print hashes[1], hashes[2]
-          exit
-        }
-      ' "$CTI_PATCH"
-    )
-    [ -n "$base_hash" ] && [ -n "$desired_hash" ] || {
-      echo "✗ CTI patch metadata missing for $target" >&2
-      return 1
-    }
-    current_hash="$(git -C "$CTI_SKILL" hash-object "$target")"
-    case "$current_hash" in
-      "$desired_hash"*) ;;
-      "$base_hash"*) absent_targets="$absent_targets $target" ;;
-      *) drifted_targets="$drifted_targets $target" ;;
-    esac
-  done
-
-  if [ -n "$drifted_targets" ]; then
-    if [ "$UPDATE_EXISTING" = "1" ]; then
-      echo "✗ CTI patch targets drifted:$drifted_targets" >&2
-      echo "  Refresh library/claude-to-im.patch against the current submodule before updating." >&2
-      return 1
-    fi
-    echo "→ CTI patch targets drifted; skipping patch (UPDATE_EXISTING=0):$drifted_targets"
-    return
-  fi
-
-  if [ -n "$absent_targets" ]; then
-    local -a apply_args=()
-    for target in $absent_targets; do
-      apply_args+=("--include=$target")
-    done
-    git -C "$CTI_SKILL" apply "${apply_args[@]}" "$CTI_PATCH"
-    CTI_PATCH_CHANGED=1
-  fi
 }
 
 daemon_bundle_is_stale() {
@@ -315,10 +263,8 @@ converge_tracked_instance_services() {
   done
 }
 
-apply_component_patch
-
 run_npm_install "$CTI_CORE"
-run_npm_install "$CTI_SKILL" "$CTI_PATCH_CHANGED"
+run_npm_install "$CTI_SKILL"
 
 bundle_rebuilt=0
 if daemon_bundle_is_stale; then
@@ -326,7 +272,7 @@ if daemon_bundle_is_stale; then
   bundle_rebuilt=1
 fi
 materialize_tracked_instance_configs
-if [ "$CTI_PATCH_CHANGED" = "1" ] || [ "$CTI_DEPENDENCIES_CHANGED" = "1" ] || [ "$bundle_rebuilt" = "1" ]; then
+if [ "$CTI_DEPENDENCIES_CHANGED" = "1" ] || [ "$bundle_rebuilt" = "1" ]; then
   restart_managed_instances
   bundle_changed=1
 else
