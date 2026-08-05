@@ -23,7 +23,7 @@ import * as bridgeManager from 'claude-to-im/src/lib/bridge/bridge-manager.js';
 import 'claude-to-im/src/lib/bridge/adapters/index.js';
 import './adapters/weixin-adapter.js';
 
-import type { LLMProvider } from 'claude-to-im/src/lib/bridge/host.js';
+import type { AskQuestion, LLMProvider } from 'claude-to-im/src/lib/bridge/host.js';
 import { loadConfig, configToSettings, codexProviderOptionsFromConfig, CTI_HOME } from './config.js';
 import type { Config } from './config.js';
 import { JsonFileStore } from './store.js';
@@ -151,6 +151,16 @@ async function main(): Promise<void> {
   const gateway = {
     resolvePendingPermission: (id: string, resolution: { behavior: 'allow' | 'deny'; message?: string }) =>
       pendingPerms.resolve(id, resolution),
+    resolvePendingQuestion: (
+      id: string,
+      resolution: {
+        behavior: 'allow' | 'deny';
+        message?: string;
+        updatedInput?: { questions: AskQuestion[]; answers: Record<string, string> };
+      },
+    ) => resolution.behavior === 'allow' && resolution.updatedInput
+      ? pendingPerms.resolveQuestion(id, resolution.updatedInput)
+      : pendingPerms.resolve(id, { behavior: 'deny', message: resolution.message }),
   };
 
   initBridgeContext({

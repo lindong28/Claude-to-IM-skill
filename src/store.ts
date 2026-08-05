@@ -18,6 +18,8 @@ import type {
   PermissionLinkRecord,
   OutboundRefInput,
   UpsertChannelBindingInput,
+  PendingQuestionRecord,
+  PendingQuestionState,
 } from 'claude-to-im/src/lib/bridge/host.js';
 import type { ChannelBinding, ChannelType } from 'claude-to-im/src/lib/bridge/types.js';
 import { CTI_HOME } from './config.js';
@@ -73,6 +75,7 @@ export class JsonFileStore implements BridgeStore {
   private bindings = new Map<string, ChannelBinding>();
   private messages = new Map<string, BridgeMessage[]>();
   private permissionLinks = new Map<string, PermissionLinkRecord>();
+  private pendingQuestions = new Map<string, PendingQuestionRecord>();
   private offsets = new Map<string, string>();
   private dedupKeys = new Map<string, number>();
   private locks = new Map<string, LockEntry>();
@@ -115,6 +118,14 @@ export class JsonFileStore implements BridgeStore {
       this.permissionLinks.set(id, p);
     }
 
+    const questions = readJson<Record<string, PendingQuestionRecord>>(
+      path.join(DATA_DIR, 'questions.json'),
+      {},
+    );
+    for (const [id, question] of Object.entries(questions)) {
+      this.pendingQuestions.set(id, question);
+    }
+
     // Offsets
     const offsets = readJson<Record<string, string>>(
       path.join(DATA_DIR, 'offsets.json'),
@@ -155,6 +166,13 @@ export class JsonFileStore implements BridgeStore {
     writeJson(
       path.join(DATA_DIR, 'permissions.json'),
       Object.fromEntries(this.permissionLinks),
+    );
+  }
+
+  private persistQuestions(questions: Map<string, PendingQuestionRecord> = this.pendingQuestions): void {
+    writeJson(
+      path.join(DATA_DIR, 'questions.json'),
+      Object.fromEntries(questions),
     );
   }
 
@@ -459,6 +477,36 @@ export class JsonFileStore implements BridgeStore {
       }
     }
     return result;
+  }
+
+  savePendingQuestion(record: PendingQuestionRecord): void {
+    const next = new Map(this.pendingQuestions);
+    next.set(record.questionRequestId, structuredClone(record));
+    this.persistQuestions(next);
+    this.pendingQuestions = next;
+  }
+
+  getPendingQuestion(questionRequestId: string): PendingQuestionRecord | null {
+    const record = this.pendingQuestions.get(questionRequestId);
+    return record ? structuredClone(record) : null;
+  }
+
+  listPendingQuestions(): PendingQuestionRecord[] {
+    return [...this.pendingQuestions.values()].map((record) => structuredClone(record));
+  }
+
+  transitionPendingQuestion(
+    questionRequestId: string,
+    expectedStates: PendingQuestionState[],
+    update: Partial<PendingQuestionRecord>,
+  ): boolean {
+    const current = this.pendingQuestions.get(questionRequestId);
+    if (!current || !expectedStates.includes(current.state)) return false;
+    const next = new Map(this.pendingQuestions);
+    next.set(questionRequestId, { ...current, ...structuredClone(update) });
+    this.persistQuestions(next);
+    this.pendingQuestions = next;
+    return true;
   }
 
   // ── Channel Offsets ──

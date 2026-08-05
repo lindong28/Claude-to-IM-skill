@@ -17,6 +17,12 @@ All tokens and secrets are masked in log output and terminal display. Only the l
 - `logs` command output
 - Error messages
 
+## Provider and Outbound Isolation
+
+The Claude provider subprocess never receives the bridge's secret-bearing environment keys (`CTI_TG_BOT_TOKEN`, `CTI_DISCORD_BOT_TOKEN`, `CTI_FEISHU_APP_SECRET`, or `CTI_QQ_APP_SECRET`), including when `CTI_ENV_ISOLATION=inherit`. Non-secret bridge configuration continues to follow the selected isolation mode.
+
+Before any reply, streaming preview, error, or interactive-card text leaves the bridge, the delivery layer replaces exact configured secret literals. Streaming redaction retains enough boundary state to catch a literal split across chunks. This is a containment control for known configured values, not pattern-based DLP: an unregistered secret, an encoded/transformed value, or a secret readable from another same-user process or file remains outside this guarantee.
+
 ## Threat Model
 
 This project operates as a **single-user local daemon**:
@@ -30,6 +36,7 @@ The primary threats are:
 
 - **Token leakage**: Mitigated by file permissions, log redaction, and `.gitignore`
 - **Unauthorized message senders**: Mitigated by allowed user ID filtering per platform
+- **Forged or repeated card answers**: Mitigated by applying the same Feishu user/group allowlists to callbacks, generation-scoped question IDs, and compare-and-set terminal transitions
 - **Local privilege escalation**: Mitigated by running as unprivileged user process
 
 ## Token Rotation

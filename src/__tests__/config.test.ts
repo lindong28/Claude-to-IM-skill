@@ -188,6 +188,12 @@ describe('configToSettings', () => {
     assert.equal(m.get('bridge_default_mode'), 'plan');
   });
 
+  it('maps an opt-in fixed mode independently of the session policy', () => {
+    const m = configToSettings({ ...base, fixedMode: 'code' });
+    assert.equal(m.get('bridge_fixed_mode'), 'code');
+    assert.equal(m.has('bridge_session_policy'), false);
+  });
+
   it('omits optional fields when not set', () => {
     const m = configToSettings(base);
     assert.equal(m.has('telegram_bot_token'), false);
@@ -197,6 +203,7 @@ describe('configToSettings', () => {
     assert.equal(m.has('bridge_feishu_group_allow_from'), false);
     assert.equal(m.has('bridge_feishu_require_mention'), false);
     assert.equal(m.has('bridge_session_policy'), false);
+    assert.equal(m.has('bridge_fixed_mode'), false);
   });
 });
 
@@ -258,6 +265,7 @@ describe('Feishu startup policy validation', () => {
       enabledChannels: ['weixin'],
       defaultWorkDir: '/tmp/default',
       defaultMode: 'code',
+      fixedMode: 'code',
     }));
   });
 });
@@ -354,6 +362,7 @@ describe('loadConfig/saveConfig round-trip', () => {
     assert.deepEqual(loaded.feishuGroupAllowFrom, config.feishuGroupAllowFrom);
     assert.equal(loaded.feishuRequireMention, config.feishuRequireMention);
     assert.equal(loaded.sessionPolicy, config.sessionPolicy);
+    assert.equal(loaded.fixedMode, config.fixedMode);
     assert.equal(loaded.codexSandboxMode, config.codexSandboxMode);
     assert.equal(loaded.codexApprovalPolicy, config.codexApprovalPolicy);
     assert.equal(loaded.codexNetworkAccess, config.codexNetworkAccess);
@@ -365,6 +374,7 @@ describe('loadConfig/saveConfig round-trip', () => {
     ['CTI_FEISHU_GROUP_POLICY', 'permissive'],
     ['CTI_FEISHU_REQUIRE_MENTION', 'yes'],
     ['CTI_SESSION_POLICY', 'mutable-ish'],
+    ['CTI_FIXED_MODE', 'mutable-ish'],
     ['CTI_CODEX_SANDBOX_MODE', 'unsafe-ish'],
     ['CTI_CODEX_APPROVAL_POLICY', 'always'],
     ['CTI_CODEX_NETWORK_ACCESS', 'yes'],

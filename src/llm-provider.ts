@@ -30,6 +30,14 @@ const ENV_WHITELIST = new Set([
 /** Prefixes that are always stripped (even in inherit mode). */
 const ENV_ALWAYS_STRIP = ['CLAUDECODE'];
 
+/** CTI config keys whose values are credentials and never belong in providers. */
+const CTI_SECRET_KEYS = new Set([
+  'CTI_TG_BOT_TOKEN',
+  'CTI_DISCORD_BOT_TOKEN',
+  'CTI_FEISHU_APP_SECRET',
+  'CTI_QQ_APP_SECRET',
+]);
+
 // ── Auth/credential-error detection ──
 
 /** Patterns indicating the local CLI is not logged in (fixable via `claude auth login`). */
@@ -102,12 +110,14 @@ export function buildSubprocessEnv(): Record<string, string> {
     for (const [k, v] of Object.entries(process.env)) {
       if (v === undefined) continue;
       if (ENV_ALWAYS_STRIP.includes(k)) continue;
+      if (CTI_SECRET_KEYS.has(k)) continue;
       out[k] = v;
     }
   } else {
     // Strict: whitelist only
     for (const [k, v] of Object.entries(process.env)) {
       if (v === undefined) continue;
+      if (CTI_SECRET_KEYS.has(k)) continue;
       if (ENV_WHITELIST.has(k)) { out[k] = v; continue; }
       // Pass through CTI_* so skill config is available
       if (k.startsWith('CTI_')) { out[k] = v; continue; }
@@ -480,6 +490,26 @@ export class SDKLLMProvider implements LLMProvider {
                   input: Record<string, unknown>,
                   opts: { toolUseID: string; suggestions?: string[] },
                 ): Promise<PermissionResult> => {
+                  if (toolName === 'AskUserQuestion') {
+                    const waiting = pendingPerms.waitForQuestion(opts.toolUseID);
+                    controller.enqueue(
+                      sseEvent('permission_request', {
+                        permissionRequestId: opts.toolUseID,
+                        toolName,
+                        toolInput: input,
+                        suggestions: [],
+                      }),
+                    );
+                    const result = await waiting;
+                    if (result.behavior === 'allow' && result.updatedInput) {
+                      return { behavior: 'allow' as const, updatedInput: result.updatedInput };
+                    }
+                    return {
+                      behavior: 'deny' as const,
+                      message: result.message || 'Question was not answered',
+                    };
+                  }
+
                   // Auto-approve if configured (useful for channels without
                   // interactive permission UI, e.g. Feishu WebSocket mode)
                   if (autoApprove) {

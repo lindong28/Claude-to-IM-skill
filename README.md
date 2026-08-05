@@ -231,6 +231,10 @@ Open your IM app and send a message to your bot. Claude Code / Codex will respon
 
 Interactive runtimes may send permission buttons or `/perm` prompts. A Codex instance configured with `CTI_CODEX_APPROVAL_POLICY=never` never asks for permission and therefore sends no Feishu permission card; tool access is bounded by its sandbox policy instead.
 
+Claude Code `AskUserQuestion` prompts are sent to Feishu as interactive cards supporting one to four questions, single- and multi-select answers, and free-form Other answers. The bridge persists the pending question before sending the card, rejects callbacks outside the configured user/group allowlists, rejects stale or repeated submissions, and restores an unresolved prompt after a daemon restart. An adapter without question-card capability, a send failure, or an unanswered-card timeout changes the prompt to `fallback-pending`, releases the blocked SDK call, and accepts the next authorized text message as the answer until the request expires.
+
+Set `CTI_FIXED_MODE=code` (or `plan` / `ask`) only for an instance that must not change mode. In a fixed-mode instance `/mode` rejects a different mode and acknowledges the configured mode; instances without this key retain the existing mutable `/mode` behavior.
+
 ## Commands
 
 All commands are run inside Claude Code or Codex:
@@ -286,7 +290,7 @@ The `setup` wizard provides inline guidance for every step. Here's a summary:
 4. Enable Bot feature under "Add Features"
 5. Configure both `CTI_FEISHU_ALLOWED_USERS` and `CTI_FEISHU_GROUP_ALLOW_FROM`, set group policy to `allowlist`, and require mentions; verify the opaque user/group IDs from controlled inbound event metadata without logging them
 6. **Events & Callbacks**: after Phase 1 is published and the same instance is running, select **"Long Connection"** → add `im.message.receive_v1`
-7. Add `card.action.trigger` only for a runtime that produces interactive approval cards. It is unnecessary for Codex with approval `never`
+7. Add `card.action.trigger` for a runtime that produces interactive approval cards or Claude Code `AskUserQuestion` cards. It is unnecessary only when the instance can produce neither flow, such as Codex with approval `never`
 8. **Publish** Phase 2 and obtain admin approval
 
 ### QQ
@@ -327,6 +331,7 @@ Additional notes:
 │   ├── sessions.json
 │   ├── bindings.json
 │   ├── permissions.json
+│   ├── questions.json
 │   └── messages/          ← Per-session message history
 ├── logs/
 │   └── bridge.log         ← Auto-rotated, secrets redacted
@@ -366,6 +371,8 @@ This flow applies only when the selected runtime requests approval; it is absent
 6. SDK continues tool execution → result streamed back to IM
 ```
 
+`AskUserQuestion` uses the same authenticated Feishu card callback channel but a separate durable lifecycle. The stored states are `pending-send`, `sent`, `fallback-pending`, `answered`, and `expired`; state transitions are compare-and-set so restart re-issue and concurrent clicks cannot resume the SDK call more than once.
+
 ## Troubleshooting
 
 Run diagnostics:
@@ -393,6 +400,7 @@ See [references/troubleshooting.md](references/troubleshooting.md) for more deta
 
 - All credentials stored in `~/.claude-to-im/config.env` with `chmod 600`
 - Tokens are automatically redacted in all log output (pattern-based masking)
+- IM-bound replies, stream chunks, errors, and card text redact exact configured secret literals at the unified delivery boundary, including a literal split across adjacent stream chunks
 - Allowed user/channel/guild lists restrict who can interact with the bot
 - The daemon is a local process with no inbound network listeners
 - See [SECURITY.md](SECURITY.md) for threat model and incident response

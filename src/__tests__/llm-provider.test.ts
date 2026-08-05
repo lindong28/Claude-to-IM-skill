@@ -7,6 +7,7 @@ import {
   isNonClaudeModel,
   parseCliMajorVersion,
   handleMessage,
+  buildSubprocessEnv,
 } from '../llm-provider.js';
 import type { StreamState } from '../llm-provider.js';
 import { sseEvent } from '../sse-utils.js';
@@ -28,6 +29,50 @@ function makeFakeController() {
 function freshState(): StreamState {
   return { hasReceivedResult: false, hasStreamedText: false, lastAssistantText: '' };
 }
+
+describe('buildSubprocessEnv secret isolation', () => {
+  it('strips every secret-bearing CTI key while preserving non-secret CTI settings', () => {
+    const saved = { ...process.env };
+    try {
+      process.env.CTI_ENV_ISOLATION = 'strict';
+      process.env.CTI_RUNTIME = 'claude';
+      process.env.CTI_FEISHU_APP_SECRET = 'feishu-secret-canary';
+      process.env.CTI_TG_BOT_TOKEN = 'telegram-secret-canary';
+      process.env.CTI_DISCORD_BOT_TOKEN = 'discord-secret-canary';
+      process.env.CTI_QQ_APP_SECRET = 'qq-secret-canary';
+      process.env.CTI_DEFAULT_MODE = 'code';
+      process.env.CTI_FEISHU_APP_ID = 'cli_app_id_allowed';
+
+      const env = buildSubprocessEnv();
+
+      assert.equal(env.CTI_FEISHU_APP_SECRET, undefined);
+      assert.equal(env.CTI_TG_BOT_TOKEN, undefined);
+      assert.equal(env.CTI_DISCORD_BOT_TOKEN, undefined);
+      assert.equal(env.CTI_QQ_APP_SECRET, undefined);
+      assert.equal(env.CTI_DEFAULT_MODE, 'code');
+      assert.equal(env.CTI_FEISHU_APP_ID, 'cli_app_id_allowed');
+      assert.doesNotMatch(JSON.stringify(env), /secret-canary/);
+    } finally {
+      for (const key of Object.keys(process.env)) delete process.env[key];
+      Object.assign(process.env, saved);
+    }
+  });
+
+  it('also strips secret-bearing CTI keys in inherit mode', () => {
+    const savedMode = process.env.CTI_ENV_ISOLATION;
+    const savedSecret = process.env.CTI_FEISHU_APP_SECRET;
+    try {
+      process.env.CTI_ENV_ISOLATION = 'inherit';
+      process.env.CTI_FEISHU_APP_SECRET = 'inherit-secret-canary';
+      assert.equal(buildSubprocessEnv().CTI_FEISHU_APP_SECRET, undefined);
+    } finally {
+      if (savedMode === undefined) delete process.env.CTI_ENV_ISOLATION;
+      else process.env.CTI_ENV_ISOLATION = savedMode;
+      if (savedSecret === undefined) delete process.env.CTI_FEISHU_APP_SECRET;
+      else process.env.CTI_FEISHU_APP_SECRET = savedSecret;
+    }
+  });
+});
 
 // ── classifyAuthError ──
 

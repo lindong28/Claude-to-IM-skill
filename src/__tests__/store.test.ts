@@ -241,6 +241,42 @@ describe('JsonFileStore', () => {
     assert.equal(store.markPermissionLinkResolved('unknown'), false);
   });
 
+  it('persists pending-question lifecycle and applies idempotent transitions across restart', () => {
+    const store = new JsonFileStore(makeSettings());
+    store.savePendingQuestion({
+      questionRequestId: 'ask-persist',
+      channelType: 'feishu',
+      chatId: 'group',
+      sessionId: 'session',
+      questions: [{
+        question: 'Continue?',
+        header: 'Continue',
+        options: [
+          { label: 'Yes', description: 'Proceed' },
+          { label: 'No', description: 'Stop' },
+        ],
+        multiSelect: false,
+      }],
+      answers: {},
+      state: 'pending-send',
+      generation: 'generation-1',
+      createdAt: new Date(0).toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+
+    const restarted = new JsonFileStore(makeSettings());
+    assert.equal(restarted.getPendingQuestion('ask-persist')?.state, 'pending-send');
+    assert.equal(restarted.transitionPendingQuestion('ask-persist', ['pending-send'], {
+      state: 'sent',
+      messageId: 'card-1',
+    }), true);
+    assert.equal(restarted.transitionPendingQuestion('ask-persist', ['pending-send'], {
+      state: 'sent',
+    }), false);
+    assert.equal(restarted.getPendingQuestion('ask-persist')?.messageId, 'card-1');
+    assert.equal(mode(path.join(DATA_DIR, 'questions.json')), 0o600);
+  });
+
   it('listPendingPermissionLinksByChat returns only unresolved links for the chat', () => {
     const store = new JsonFileStore(makeSettings());
     store.insertPermissionLink({

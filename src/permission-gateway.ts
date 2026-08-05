@@ -1,6 +1,12 @@
+import type { AskQuestion } from 'claude-to-im/src/lib/bridge/host.js';
+
 export interface PermissionResult {
   behavior: 'allow' | 'deny';
   message?: string;
+  updatedInput?: {
+    questions: AskQuestion[];
+    answers: Record<string, string>;
+  };
 }
 
 export interface PermissionResolution {
@@ -23,6 +29,25 @@ export class PendingPermissions {
       }, this.timeoutMs);
       this.pending.set(toolUseID, { resolve, timer });
     });
+  }
+
+  waitForQuestion(toolUseID: string): Promise<PermissionResult> {
+    return this.waitFor(toolUseID);
+  }
+
+  resolveQuestion(
+    questionRequestId: string,
+    updatedInput: {
+      questions: AskQuestion[];
+      answers: Record<string, string>;
+    },
+  ): boolean {
+    const entry = this.pending.get(questionRequestId);
+    if (!entry) return false;
+    clearTimeout(entry.timer);
+    entry.resolve({ behavior: 'allow', updatedInput });
+    this.pending.delete(questionRequestId);
+    return true;
   }
 
   resolve(permissionRequestId: string, resolution: PermissionResolution): boolean {

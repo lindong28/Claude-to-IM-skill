@@ -12,6 +12,7 @@ export interface Config {
   defaultWorkDir: string;
   defaultModel?: string;
   defaultMode: string;
+  fixedMode?: 'code' | 'plan' | 'ask';
   // Telegram
   tgBotToken?: string;
   tgChatId?: string;
@@ -100,6 +101,12 @@ function parseSessionPolicy(value: string | undefined): Config['sessionPolicy'] 
   throw new Error('Configuration error: CTI_SESSION_POLICY must be fixed-confirm-recovery');
 }
 
+function parseFixedMode(value: string | undefined): Config['fixedMode'] {
+  if (value === undefined || value === '') return undefined;
+  if (value === 'code' || value === 'plan' || value === 'ask') return value;
+  throw new Error('Configuration error: CTI_FIXED_MODE must be code, plan, or ask');
+}
+
 function parseCodexSandboxMode(value: string | undefined): Config['codexSandboxMode'] {
   if (value === undefined || value === '') return undefined;
   if (value === 'read-only' || value === 'workspace-write' || value === 'danger-full-access') return value;
@@ -142,6 +149,7 @@ export function loadConfig(): Config {
     defaultWorkDir: env.get("CTI_DEFAULT_WORKDIR") || process.cwd(),
     defaultModel: env.get("CTI_DEFAULT_MODEL") || undefined,
     defaultMode: env.get("CTI_DEFAULT_MODE") || "code",
+    fixedMode: parseFixedMode(env.get('CTI_FIXED_MODE')),
     tgBotToken: env.get("CTI_TG_BOT_TOKEN") || undefined,
     tgChatId: env.get("CTI_TG_CHAT_ID") || undefined,
     tgAllowedUsers: splitCsv(env.get("CTI_TG_ALLOWED_USERS")),
@@ -228,6 +236,7 @@ export function saveConfig(config: Config): void {
     config.enabledChannels.join(",")
   );
   out += formatEnvLine("CTI_DEFAULT_WORKDIR", config.defaultWorkDir);
+  out += formatEnvLine("CTI_FIXED_MODE", config.fixedMode);
   const namedInstance = Boolean(process.env.CTI_INSTANCE && process.env.CTI_INSTANCE !== 'default');
   if (config.defaultModel && !namedInstance) out += formatEnvLine("CTI_DEFAULT_MODEL", config.defaultModel);
   out += formatEnvLine("CTI_DEFAULT_MODE", config.defaultMode);
@@ -411,6 +420,7 @@ export function configToSettings(config: Config): Map<string, string> {
     m.set("default_model", config.defaultModel);
   }
   m.set("bridge_default_mode", config.defaultMode);
+  if (config.fixedMode) m.set('bridge_fixed_mode', config.fixedMode);
 
   return m;
 }

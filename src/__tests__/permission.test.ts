@@ -67,4 +67,44 @@ describe('PendingPermissions', () => {
     assert.match(result.message!, /timed out/i);
     assert.equal(pp.size, 0);
   });
+
+  it('returns a complete AskUserQuestion answers mapping exactly once', async () => {
+    const pp = new PendingPermissions();
+    const questions = [
+      {
+        question: 'Database?',
+        header: 'Database',
+        options: [
+          { label: 'PostgreSQL', description: 'Relational' },
+          { label: 'MongoDB', description: 'Document' },
+        ],
+        multiSelect: false,
+      },
+      {
+        question: 'Features?',
+        header: 'Features',
+        options: [
+          { label: 'Auth', description: 'Authentication' },
+          { label: 'Cache', description: 'Caching' },
+        ],
+        multiSelect: true,
+      },
+    ];
+    const waiting = pp.waitForQuestion('ask-1');
+    assert.equal(pp.resolveQuestion('ask-1', {
+      questions,
+      answers: { 'Database?': 'PostgreSQL', 'Features?': 'Auth, Cache' },
+    }), true);
+    assert.equal(pp.resolveQuestion('ask-1', {
+      questions: [],
+      answers: {},
+    }), false);
+    assert.deepEqual(await waiting, {
+      behavior: 'allow',
+      updatedInput: {
+        questions,
+        answers: { 'Database?': 'PostgreSQL', 'Features?': 'Auth, Cache' },
+      },
+    });
+  });
 });
