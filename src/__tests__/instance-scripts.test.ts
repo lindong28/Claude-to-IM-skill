@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -8,6 +9,7 @@ import crypto from 'node:crypto';
 
 const SKILL_DIR = path.resolve(import.meta.dirname, '../..');
 const SCRIPTS_DIR = path.join(SKILL_DIR, 'scripts');
+const MACOS_LAUNCHD_SKIP_REASON = 'requires macOS launchd and plutil semantics';
 
 function shell(command: string, env: NodeJS.ProcessEnv): string {
   return execFileSync('/bin/bash', ['-c', command], {
@@ -25,13 +27,17 @@ function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-describe('instance-aware lifecycle scripts', () => {
+describe('instance-aware macOS lifecycle scripts', {
+  skip: process.platform === 'darwin' ? false : MACOS_LAUNCHD_SKIP_REASON,
+}, () => {
   let home: string;
   let binDir: string;
   let launchctlLog: string;
   let env: NodeJS.ProcessEnv;
+  let childProcesses: Set<ChildProcess>;
 
   beforeEach(() => {
+    childProcesses = new Set();
     home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cti-instance-')));
     binDir = path.join(home, 'bin');
     launchctlLog = path.join(home, 'launchctl.log');
@@ -60,7 +66,20 @@ describe('instance-aware lifecycle scripts', () => {
     };
   });
 
-  afterEach(() => fs.rmSync(home, { recursive: true, force: true }));
+  afterEach(async () => {
+    try {
+      await Promise.all([...childProcesses].map((child) => new Promise<void>((resolve) => {
+        if (child.exitCode !== null || child.signalCode !== null) {
+          resolve();
+          return;
+        }
+        child.once('exit', () => resolve());
+        child.kill('SIGTERM');
+      })));
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
 
   it('resolves default and named identities while preserving an explicit home', () => {
     const defaultOut = shell(
@@ -457,6 +476,7 @@ describe('instance-aware lifecycle scripts', () => {
       },
       stdio: 'ignore',
     });
+    childProcesses.add(first);
     await new Promise((resolve) => setTimeout(resolve, 150));
     const second = spawnSync('/bin/bash', [path.join(SCRIPTS_DIR, 'daemon.sh'), 'stop'], {
       env: { ...process.env, ...env, CTI_INSTANCE: 'quant-lab' },
@@ -467,6 +487,7 @@ describe('instance-aware lifecycle scripts', () => {
     await new Promise<void>((resolve, reject) => {
       first.once('exit', (code) => code === 0 ? resolve() : reject(new Error(`first exit ${code}`)));
     });
+    childProcesses.delete(first);
   });
 
   it('never follows a lifecycle-lock symlink swapped during stale repair', () => {
@@ -759,24 +780,32 @@ describe('instance-aware lifecycle scripts', () => {
     assert.match(reconnectedThenCrashedOutput, /\[FAIL\]\s+Codex provider not current \(last success 2026-07-16T00:00:00.800Z\)/);
   });
 
+});
+
+describe('portable instance contracts', () => {
   it('keeps the Linux default-home contract and exposes a safe uninstall hook', () => {
-    const output = shell(
-      [
-        'set -e',
-        'unset CTI_HOME CTI_INSTANCE',
-        'source scripts/instance-env.sh',
-        'PID_FILE="$CTI_HOME/runtime/bridge.pid"',
-        'LOG_FILE="$CTI_HOME/logs/bridge.log"',
-        'SKILL_DIR="$PWD"',
-        'read_pid() { :; }',
-        'pid_alive() { return 1; }',
-        'source scripts/supervisor-linux.sh',
-        'declare -F supervisor_uninstall >/dev/null',
-        'printf "%s|%s" "$CTI_INSTANCE" "$CTI_HOME"',
-      ].join('; '),
-      env,
-    );
-    assert.equal(output, `default|${home}/.claude-to-im`);
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cti-instance-portable-')));
+    try {
+      const output = shell(
+        [
+          'set -e',
+          'unset CTI_HOME CTI_INSTANCE',
+          'source scripts/instance-env.sh',
+          'PID_FILE="$CTI_HOME/runtime/bridge.pid"',
+          'LOG_FILE="$CTI_HOME/logs/bridge.log"',
+          'SKILL_DIR="$PWD"',
+          'read_pid() { :; }',
+          'pid_alive() { return 1; }',
+          'source scripts/supervisor-linux.sh',
+          'declare -F supervisor_uninstall >/dev/null',
+          'printf "%s|%s" "$CTI_INSTANCE" "$CTI_HOME"',
+        ].join('; '),
+        { HOME: home, CTI_HOME: '', CTI_INSTANCE: '' },
+      );
+      assert.equal(output, `default|${home}/.claude-to-im`);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it('preserves the Windows default home and service identity contract', () => {
