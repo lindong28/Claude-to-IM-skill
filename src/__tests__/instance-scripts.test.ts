@@ -1039,6 +1039,66 @@ describe('portable instance contracts', () => {
     assert.doesNotMatch(example, /CTI_FEISHU_DOMAIN=https?:\/\//);
   });
 
+  it('reports effective persisted Claude binding modes and fixed overrides without changing them', () => {
+    const fixture = createPortableDoctorFixture();
+    try {
+      writePortableDoctorConfig(fixture.namedHome, 'feishu');
+      const configPath = path.join(fixture.namedHome, 'config.env');
+      fs.writeFileSync(
+        configPath,
+        fs.readFileSync(configPath, 'utf8').replace('CTI_RUNTIME=codex', 'CTI_RUNTIME=claude'),
+        { mode: 0o600 },
+      );
+      fs.writeFileSync(path.join(fixture.namedHome, 'data', 'bindings.json'), JSON.stringify({
+        'feishu:one': { mode: 'code' },
+        'feishu:two': { mode: 'ask' },
+        'feishu:three': { mode: 'plan' },
+      }), { mode: 0o600 });
+      let result = spawnSync('/bin/bash', [path.join(SCRIPTS_DIR, 'doctor.sh')], {
+        env: { ...process.env, ...fixture.env },
+        encoding: 'utf8',
+      });
+      let output = `${result.stdout}${result.stderr}`;
+      assert.match(output, /\[INFO\]\s+Claude configured mode for new bindings is acceptEdits/);
+      assert.match(output, /\[INFO\]\s+Claude effective existing binding modes: acceptEdits=1, default=1, plan=1/);
+      assert.doesNotMatch(output, /filesystem setting sources/);
+      assert.match(output, /\[INFO\]\s+Claude unresolved tool requests require IM approval/);
+
+      fs.appendFileSync(path.join(fixture.namedHome, 'config.env'), 'CTI_FIXED_MODE=ask\n');
+      result = spawnSync('/bin/bash', [path.join(SCRIPTS_DIR, 'doctor.sh')], {
+        env: { ...process.env, ...fixture.env },
+        encoding: 'utf8',
+      });
+      output = `${result.stdout}${result.stderr}`;
+      assert.match(output, /\[INFO\]\s+Claude effective binding mode is default \(fixed by CTI_FIXED_MODE=ask; applies to all bindings\)/);
+
+      fs.appendFileSync(path.join(fixture.namedHome, 'config.env'), 'CTI_AUTO_APPROVE=true\n');
+      result = spawnSync('/bin/bash', [path.join(SCRIPTS_DIR, 'doctor.sh')], {
+        env: { ...process.env, ...fixture.env },
+        encoding: 'utf8',
+      });
+      assert.match(`${result.stdout}${result.stderr}`, /\[INFO\]\s+Claude unresolved tool requests are auto-approved \(CTI_AUTO_APPROVE=true\)/);
+    } finally {
+      fs.rmSync(fixture.home, { recursive: true, force: true });
+    }
+  });
+
+  it('does not print Claude posture claims for a Codex-only instance', () => {
+    const fixture = createPortableDoctorFixture();
+    try {
+      writePortableDoctorConfig(fixture.namedHome, 'feishu');
+      const result = spawnSync('/bin/bash', [path.join(SCRIPTS_DIR, 'doctor.sh')], {
+        env: { ...process.env, ...fixture.env },
+        encoding: 'utf8',
+      });
+      const output = `${result.stdout}${result.stderr}`;
+      assert.match(output, /Codex effective policy:/);
+      assert.doesNotMatch(output, /Claude .*permission mode|Claude unresolved tool requests|filesystem setting sources/);
+    } finally {
+      fs.rmSync(fixture.home, { recursive: true, force: true });
+    }
+  });
+
   it('runs the repository installer contract when GNU stat -f returns filesystem output', () => {
     const fixture = createPortableDoctorFixture();
     try {

@@ -39,6 +39,10 @@ check() {
   fi
 }
 
+info() {
+  echo "[INFO] $1"
+}
+
 lifecycle_lock_path() {
   local lock_key
   lock_key=$(printf '%s' "$CTI_HOME_CANONICAL" | shasum -a 256 | awk '{print $1}')
@@ -252,6 +256,61 @@ CTI_RUNTIME=$(get_config CTI_RUNTIME)
 CTI_RUNTIME="${CTI_RUNTIME:-claude}"
 echo "Runtime: $CTI_RUNTIME"
 echo ""
+
+# --- Claude permission posture (claude/auto modes only) ---
+if [ "$CTI_RUNTIME" = "claude" ] || [ "$CTI_RUNTIME" = "auto" ]; then
+  CLAUDE_BINDING_MODE=$(get_config CTI_FIXED_MODE)
+  if [ -n "$CLAUDE_BINDING_MODE" ]; then
+    case "$CLAUDE_BINDING_MODE" in
+      code)
+        info "Claude effective binding mode is acceptEdits (fixed by CTI_FIXED_MODE=code; applies to all bindings)"
+        ;;
+      ask)
+        info "Claude effective binding mode is default (fixed by CTI_FIXED_MODE=ask; applies to all bindings)"
+        ;;
+      plan)
+        info "Claude effective binding mode is plan (fixed by CTI_FIXED_MODE=plan; applies to all bindings)"
+        ;;
+      *)
+        check "Claude fixed binding mode is code, ask, or plan (currently $CLAUDE_BINDING_MODE)" 1
+        ;;
+    esac
+  else
+    info "Claude configured mode for new bindings is acceptEdits (existing bindings retain their persisted mode)"
+    BINDINGS_FILE="$CTI_HOME/data/bindings.json"
+    if [ ! -e "$BINDINGS_FILE" ]; then
+      info "Claude effective existing binding modes: none persisted"
+    elif [ -r "$BINDINGS_FILE" ] && command -v node &>/dev/null; then
+      BINDING_COUNTS=$(node -e '
+        const fs = require("fs");
+        const bindings = Object.values(JSON.parse(fs.readFileSync(process.argv[1], "utf8")));
+        const counts = { code: 0, ask: 0, plan: 0, invalid: 0 };
+        for (const binding of bindings) {
+          const mode = binding && typeof binding === "object" ? binding.mode : undefined;
+          if (mode === "code" || mode === "ask" || mode === "plan") counts[mode] += 1;
+          else counts.invalid += 1;
+        }
+        process.stdout.write(`${counts.code}|${counts.ask}|${counts.plan}|${counts.invalid}`);
+      ' "$BINDINGS_FILE" 2>/dev/null || true)
+      if [[ "$BINDING_COUNTS" =~ ^[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+$ ]]; then
+        IFS='|' read -r BINDING_CODE_COUNT BINDING_ASK_COUNT BINDING_PLAN_COUNT BINDING_INVALID_COUNT <<< "$BINDING_COUNTS"
+        info "Claude effective existing binding modes: acceptEdits=$BINDING_CODE_COUNT, default=$BINDING_ASK_COUNT, plan=$BINDING_PLAN_COUNT"
+        if [ "$BINDING_INVALID_COUNT" != "0" ]; then
+          check "Persisted Claude binding modes are valid (invalid: $BINDING_INVALID_COUNT)" 1
+        fi
+      else
+        check "Claude effective existing binding modes are readable" 1
+      fi
+    else
+      check "Claude effective existing binding modes are readable" 1
+    fi
+  fi
+  if [ "$(get_config CTI_AUTO_APPROVE)" = "true" ]; then
+    info "Claude unresolved tool requests are auto-approved (CTI_AUTO_APPROVE=true)"
+  else
+    info "Claude unresolved tool requests require IM approval (CTI_AUTO_APPROVE is not true)"
+  fi
+fi
 
 # --- Claude CLI available (claude/auto modes) ---
 if [ "$CTI_RUNTIME" = "claude" ] || [ "$CTI_RUNTIME" = "auto" ]; then

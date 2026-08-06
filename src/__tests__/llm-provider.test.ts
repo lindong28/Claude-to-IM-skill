@@ -7,9 +7,12 @@ import {
   isNonClaudeModel,
   parseCliMajorVersion,
   handleMessage,
+  consumeSdkMessages,
   buildSubprocessEnv,
+  shouldSuppressCompletedTransportExit,
 } from '../llm-provider.js';
 import type { StreamState } from '../llm-provider.js';
+import type { SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import { sseEvent } from '../sse-utils.js';
 
 // ── Helpers ──
@@ -27,7 +30,13 @@ function makeFakeController() {
 }
 
 function freshState(): StreamState {
-  return { hasReceivedResult: false, hasStreamedText: false, lastAssistantText: '' };
+  return {
+    hasReceivedResult: false,
+    hasReachedEndTurn: false,
+    hasStreamedText: false,
+    lastAssistantHadCompletableText: false,
+    lastAssistantText: '',
+  };
 }
 
 describe('buildSubprocessEnv secret isolation', () => {
@@ -257,6 +266,18 @@ describe('handleMessage state tracking', () => {
     assert.equal(hasTextEvent, false, 'assistant text should NOT be emitted directly');
   });
 
+  it('records a final assistant end_turn', () => {
+    const { controller } = makeFakeController();
+    const state = freshState();
+
+    handleMessage({
+      type: 'assistant',
+      message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'done' }] },
+    } as any, controller, state);
+
+    assert.equal(state.hasReachedEndTurn, true);
+  });
+
   it('sets hasReceivedResult on success result', () => {
     const { controller } = makeFakeController();
     const state = freshState();
@@ -306,12 +327,470 @@ describe('handleMessage state tracking', () => {
   });
 });
 
+describe('SDK end_turn completion fallback', () => {
+  it('does not arm on a real-shaped thinking-only end_turn record before delayed text', async () => {
+    const { controller, chunks } = makeFakeController();
+    const state = freshState();
+    const abortController = new AbortController();
+    const messages = (async function* () {
+      yield {
+        type: 'assistant', parent_tool_use_id: null,
+        message: {
+          id: 'msg-real-shaped-thinking-gap',
+          stop_reason: 'end_turn',
+          content: [{ type: 'thinking', thinking: '', signature: '' }],
+        },
+      } as any;
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      yield {
+        type: 'stream_event', parent_tool_use_id: null,
+        event: { type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: 'delayed final text' } },
+      } as SDKMessage;
+      yield {
+        type: 'assistant', parent_tool_use_id: null,
+        message: {
+          id: 'msg-real-shaped-thinking-gap',
+          stop_reason: 'end_turn',
+          content: [{ type: 'text', text: 'delayed final text' }],
+        },
+      } as any;
+      yield {
+        type: 'stream_event', parent_tool_use_id: null,
+        event: { type: 'message_stop' },
+      } as SDKMessage;
+      yield {
+        type: 'result', subtype: 'success', session_id: 'session-thinking-gap', is_error: false,
+        usage: { input_tokens: 1, output_tokens: 1 }, total_cost_usd: 0,
+      } as any;
+    })();
+
+    await consumeSdkMessages(messages, controller, state, abortController, 5);
+
+    assert.equal(abortController.signal.aborted, false);
+    assert.equal(state.hasReceivedResult, true);
+    assert.match(chunks.join('\n'), /delayed final text/);
+  });
+
+  it('does not arm a thinking-only terminal record from earlier narration in the same turn', async () => {
+    const { controller, chunks } = makeFakeController();
+    const state = freshState();
+    const abortController = new AbortController();
+    const messages = (async function* () {
+      yield {
+        type: 'stream_event', parent_tool_use_id: null,
+        event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Let me check…' } },
+      } as SDKMessage;
+      yield {
+        type: 'assistant', parent_tool_use_id: null,
+        message: {
+          id: 'msg-earlier-narration',
+          stop_reason: 'tool_use',
+          content: [
+            { type: 'text', text: 'Let me check…' },
+            { type: 'tool_use', id: 'tool-earlier', name: 'Read', input: { file_path: '/tmp/example' } },
+          ],
+        },
+      } as any;
+      yield {
+        type: 'user', parent_tool_use_id: null,
+        message: { content: [{ type: 'tool_result', tool_use_id: 'tool-earlier', content: 'done' }] },
+      } as any;
+      yield {
+        type: 'assistant', parent_tool_use_id: null,
+        message: {
+          id: 'msg-final-after-tool',
+          stop_reason: 'end_turn',
+          content: [{ type: 'thinking', thinking: '', signature: '' }],
+        },
+      } as any;
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      yield {
+        type: 'stream_event', parent_tool_use_id: null,
+        event: { type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: 'Actual final answer' } },
+      } as SDKMessage;
+      yield {
+        type: 'assistant', parent_tool_use_id: null,
+        message: {
+          id: 'msg-final-after-tool',
+          stop_reason: 'end_turn',
+          content: [{ type: 'text', text: 'Actual final answer' }],
+        },
+      } as any;
+      yield {
+        type: 'stream_event', parent_tool_use_id: null,
+        event: { type: 'message_stop' },
+      } as SDKMessage;
+      yield {
+        type: 'result', subtype: 'success', session_id: 'session-intra-turn-gap', is_error: false,
+        usage: { input_tokens: 1, output_tokens: 1 }, total_cost_usd: 0,
+      } as any;
+    })();
+
+    await consumeSdkMessages(messages, controller, state, abortController, 5);
+
+    assert.equal(abortController.signal.aborted, false);
+    assert.equal(state.hasReceivedResult, true);
+    assert.equal(state.lastAssistantText, 'Actual final answer');
+    assert.match(chunks.join('\n'), /Actual final answer/);
+  });
+
+  it('arms from the pinned SDK message_stop signal when assistant stop_reason is null', async () => {
+    const { controller, chunks } = makeFakeController();
+    const state = freshState();
+    const abortController = new AbortController();
+    const messages = (async function* () {
+      yield {
+        type: 'stream_event', parent_tool_use_id: null,
+        event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'real terminal text' } },
+      } as SDKMessage;
+      yield {
+        type: 'assistant', parent_tool_use_id: null,
+        message: { stop_reason: null, content: [{ type: 'text', text: 'real terminal text' }] },
+      } as any;
+      yield {
+        type: 'stream_event', parent_tool_use_id: null,
+        event: { type: 'message_stop' },
+      } as SDKMessage;
+      await new Promise<never>(() => undefined);
+    })();
+
+    const outcome = await Promise.race([
+      consumeSdkMessages(messages, controller, state, abortController, 5).then(() => 'completed'),
+      new Promise<string>((resolve) => setTimeout(() => resolve('hung'), 80)),
+    ]);
+
+    assert.equal(outcome, 'completed');
+    assert.equal(abortController.signal.aborted, true);
+    assert.equal(chunks.filter((chunk) => chunk.includes('real terminal text')).length, 1);
+  });
+
+  it('finishes a streamed response when the SDK never emits its result', async () => {
+    const { controller, chunks } = makeFakeController();
+    const state = freshState();
+    const abortController = new AbortController();
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => warnings.push(args.map(String).join(' '));
+
+    const messages = (async function* () {
+      yield {
+        type: 'stream_event',
+        event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'completed text' } },
+      } as SDKMessage;
+      yield {
+        type: 'assistant',
+        message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'completed text' }] },
+      } as SDKMessage;
+      await new Promise<never>(() => undefined);
+    })();
+
+    try {
+      await consumeSdkMessages(messages, controller, state, abortController, 5);
+    } finally {
+      console.warn = originalWarn;
+    }
+
+    assert.equal(abortController.signal.aborted, true);
+    assert.equal(state.hasReceivedResult, false);
+    assert.equal(chunks.filter((chunk) => chunk.includes('completed text')).length, 1);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /did not emit a result.*after a top-level terminal signal/);
+  });
+
+  it('does not arm the result deadline from a subagent end_turn', async () => {
+    const { controller } = makeFakeController();
+    const state = freshState();
+    const abortController = new AbortController();
+    const messages = (async function* () {
+      yield {
+        type: 'assistant',
+        parent_tool_use_id: 'task-tool-use',
+        message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'subagent answer' }] },
+      } as any;
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      yield {
+        type: 'assistant',
+        parent_tool_use_id: null,
+        message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'top-level answer' }] },
+      } as any;
+      yield {
+        type: 'result', subtype: 'success', session_id: 'session-top', is_error: false,
+        usage: { input_tokens: 1, output_tokens: 1 }, total_cost_usd: 0,
+      } as any;
+    })();
+
+    await consumeSdkMessages(messages, controller, state, abortController, 5);
+
+    assert.equal(abortController.signal.aborted, false);
+    assert.equal(state.hasReceivedResult, true);
+    assert.equal(state.lastAssistantText, 'top-level answer');
+  });
+
+  it('forwards subagent tool progress without accepting subagent text as the answer', () => {
+    const { controller, chunks } = makeFakeController();
+    const state = freshState();
+
+    handleMessage({
+      type: 'assistant', parent_tool_use_id: 'agent-parent',
+      message: {
+        stop_reason: 'tool_use',
+        content: [
+          { type: 'text', text: 'private child narration' },
+          { type: 'tool_use', id: 'child-tool', name: 'Read', input: { file_path: '/tmp/example' } },
+        ],
+      },
+    } as any, controller, state);
+    handleMessage({
+      type: 'user', parent_tool_use_id: 'agent-parent',
+      message: {
+        content: [{ type: 'tool_result', tool_use_id: 'child-tool', content: 'read complete', is_error: false }],
+      },
+    } as any, controller, state);
+
+    const rendered = chunks.join('\n');
+    assert.match(rendered, /"type":"tool_use"/);
+    assert.match(rendered, /"type":"tool_result"/);
+    assert.doesNotMatch(rendered, /private child narration/);
+    assert.equal(state.lastAssistantText, '');
+    assert.equal(state.hasReachedEndTurn, false);
+  });
+
+  it('does not arm from the message_stop that closes a top-level tool-use turn', async () => {
+    const { controller } = makeFakeController();
+    const state = freshState();
+    const abortController = new AbortController();
+    const messages = (async function* () {
+      yield {
+        type: 'assistant', parent_tool_use_id: null,
+        message: {
+          stop_reason: null,
+          content: [{ type: 'tool_use', id: 'agent-tool', name: 'Agent', input: {} }],
+        },
+      } as any;
+      yield {
+        type: 'stream_event', parent_tool_use_id: null,
+        event: { type: 'message_stop' },
+      } as SDKMessage;
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      yield {
+        type: 'user', parent_tool_use_id: 'agent-tool',
+        message: { content: [{ type: 'text', text: 'child done' }] },
+      } as any;
+      yield {
+        type: 'stream_event', parent_tool_use_id: null,
+        event: { type: 'message_start' },
+      } as SDKMessage;
+      yield {
+        type: 'assistant', parent_tool_use_id: null,
+        message: { stop_reason: null, content: [{ type: 'text', text: 'parent final' }] },
+      } as any;
+      yield {
+        type: 'stream_event', parent_tool_use_id: null,
+        event: { type: 'message_stop' },
+      } as SDKMessage;
+      yield {
+        type: 'result', subtype: 'success', session_id: 'session-agent', is_error: false,
+        usage: { input_tokens: 1, output_tokens: 1 }, total_cost_usd: 0,
+      } as any;
+    })();
+
+    await consumeSdkMessages(messages, controller, state, abortController, 5);
+    assert.equal(abortController.signal.aborted, false);
+    assert.equal(state.hasReceivedResult, true);
+    assert.equal(state.lastAssistantText, 'parent final');
+  });
+
+  it('disarms a top-level end_turn when later non-result activity resumes', async () => {
+    const { controller } = makeFakeController();
+    const state = freshState();
+    const abortController = new AbortController();
+    const messages = (async function* () {
+      yield {
+        type: 'assistant', parent_tool_use_id: null,
+        message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'premature terminal' }] },
+      } as SDKMessage;
+      yield {
+        type: 'stream_event', parent_tool_use_id: null,
+        event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'resumed' } },
+      } as SDKMessage;
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      yield {
+        type: 'result', subtype: 'success', session_id: 'session-resumed', is_error: false,
+        usage: { input_tokens: 1, output_tokens: 1 }, total_cost_usd: 0,
+      } as any;
+    })();
+
+    await consumeSdkMessages(messages, controller, state, abortController, 5);
+    assert.equal(abortController.signal.aborted, false);
+    assert.equal(state.hasReceivedResult, true);
+  });
+
+  it('uses only the top-level final assistant text for a no-delta fallback', async () => {
+    const { controller, chunks } = makeFakeController();
+    const state = freshState();
+    const abortController = new AbortController();
+    const messages = (async function* () {
+      yield {
+        type: 'assistant', parent_tool_use_id: 'task-tool-use',
+        message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'subagent intermediate' }] },
+      } as SDKMessage;
+      yield {
+        type: 'assistant', parent_tool_use_id: null,
+        message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'top-level final' }] },
+      } as SDKMessage;
+      await new Promise<never>(() => undefined);
+    })();
+
+    await consumeSdkMessages(messages, controller, state, abortController, 5);
+    const rendered = chunks.join('\n');
+    assert.match(rendered, /top-level final/);
+    assert.doesNotMatch(rendered, /subagent intermediate/);
+  });
+
+  it('closes the SDK iterator on the result-timeout path', async () => {
+    const { controller } = makeFakeController();
+    const state = freshState();
+    const abortController = new AbortController();
+    let nextCount = 0;
+    let returnCalled = false;
+    const messages: AsyncIterable<SDKMessage> = {
+      [Symbol.asyncIterator]() {
+        return {
+          async next() {
+            nextCount += 1;
+            if (nextCount === 1) {
+              return {
+                done: false,
+                value: {
+                  type: 'assistant', parent_tool_use_id: null,
+                  message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'done' }] },
+                } as SDKMessage,
+              };
+            }
+            return new Promise<IteratorResult<SDKMessage>>(() => undefined);
+          },
+          async return() {
+            returnCalled = true;
+            return { done: true, value: undefined };
+          },
+        };
+      },
+    };
+
+    await consumeSdkMessages(messages, controller, state, abortController, 5);
+    assert.equal(returnCalled, true);
+  });
+
+  it('processes an error result that arrives just after the result deadline', async () => {
+    const { controller, chunks } = makeFakeController();
+    const state = freshState();
+    const abortController = new AbortController();
+    const messages = (async function* () {
+      yield {
+        type: 'assistant', parent_tool_use_id: null,
+        message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'candidate answer' }] },
+      } as SDKMessage;
+      await new Promise((resolve) => setTimeout(resolve, 8));
+      yield {
+        type: 'result', subtype: 'error_during_execution', is_error: true,
+        errors: ['late terminal error'],
+      } as SDKMessage;
+    })();
+
+    await consumeSdkMessages(messages, controller, state, abortController, 5);
+    assert.equal(state.hasReceivedResult, true);
+    assert.match(chunks.join('\n'), /late terminal error/);
+    assert.doesNotMatch(chunks.join('\n'), /candidate answer/);
+  });
+
+  it('returns immediately after a drained result instead of reading the aborted iterator again', async () => {
+    const { controller, chunks } = makeFakeController();
+    const state = freshState();
+    const abortController = new AbortController();
+    let nextCount = 0;
+    const messages: AsyncIterable<SDKMessage> = {
+      [Symbol.asyncIterator]() {
+        return {
+          async next(): Promise<IteratorResult<SDKMessage>> {
+            nextCount += 1;
+            if (nextCount === 1) {
+              return {
+                done: false,
+                value: {
+                  type: 'assistant', parent_tool_use_id: null,
+                  message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'candidate' }] },
+                } as any,
+              };
+            }
+            if (nextCount === 2) {
+              await new Promise((resolve) => setTimeout(resolve, 8));
+              return {
+                done: false,
+                value: {
+                  type: 'result', subtype: 'success', session_id: 'session-drained', is_error: false,
+                  usage: { input_tokens: 1, output_tokens: 1 }, total_cost_usd: 0,
+                } as any,
+              };
+            }
+            throw new Error('iterator read after terminal result');
+          },
+        };
+      },
+    };
+
+    await consumeSdkMessages(messages, controller, state, abortController, 5);
+
+    assert.equal(nextCount, 2);
+    assert.equal(state.hasReceivedResult, true);
+    assert.doesNotMatch(chunks.join('\n'), /iterator read after terminal result/);
+  });
+
+  it('lets a normal result reach iterator completion and runs iterator cleanup', async () => {
+    const { controller } = makeFakeController();
+    const state = freshState();
+    const abortController = new AbortController();
+    let nextCount = 0;
+    let doneObserved = false;
+    let returnCalled = false;
+    const messages: AsyncIterable<SDKMessage> = {
+      [Symbol.asyncIterator]() {
+        return {
+          async next(): Promise<IteratorResult<SDKMessage>> {
+            nextCount += 1;
+            if (nextCount === 1) {
+              return {
+                done: false,
+                value: {
+                  type: 'result', subtype: 'success', session_id: 'session-normal-result', is_error: false,
+                  usage: { input_tokens: 1, output_tokens: 1 }, total_cost_usd: 0,
+                } as any,
+              };
+            }
+            doneObserved = true;
+            return { done: true, value: undefined };
+          },
+          async return() {
+            returnCalled = true;
+            return { done: true, value: undefined };
+          },
+        };
+      },
+    };
+
+    await consumeSdkMessages(messages, controller, state, abortController, 5);
+
+    assert.equal(state.hasReceivedResult, true);
+    assert.equal(doneObserved, true);
+    assert.equal(returnCalled, true);
+  });
+});
+
 describe('catch block error suppression logic', () => {
   // These tests verify the logic expressed in the catch block by testing
   // the state conditions that drive its behavior.
 
   it('result received + exit code → should suppress (transport noise)', () => {
-    const state: StreamState = { hasReceivedResult: true, hasStreamedText: true, lastAssistantText: '' };
+    const state: StreamState = { hasReceivedResult: true, hasReachedEndTurn: false, hasStreamedText: true, lastAssistantText: '' };
     const errorMsg = 'Claude Code process exited with code 1';
     const isTransportExit = errorMsg.includes('process exited with code');
 
@@ -321,7 +800,7 @@ describe('catch block error suppression logic', () => {
   });
 
   it('partial text + exit code (no result) → should NOT suppress (real crash)', () => {
-    const state: StreamState = { hasReceivedResult: false, hasStreamedText: true, lastAssistantText: '' };
+    const state: StreamState = { hasReceivedResult: false, hasReachedEndTurn: false, hasStreamedText: true, lastAssistantText: '' };
     const errorMsg = 'Claude Code process exited with code 1';
     const isTransportExit = errorMsg.includes('process exited with code');
 
@@ -332,6 +811,7 @@ describe('catch block error suppression logic', () => {
   it('assistant text with recognised auth error → should surface as business error', () => {
     const state: StreamState = {
       hasReceivedResult: false,
+      hasReachedEndTurn: false,
       hasStreamedText: false,
       lastAssistantText: 'Your organization does not have access to Claude',
     };
@@ -344,6 +824,7 @@ describe('catch block error suppression logic', () => {
   it('assistant text with normal content + crash → should NOT surface as business error', () => {
     const state: StreamState = {
       hasReceivedResult: false,
+      hasReachedEndTurn: false,
       hasStreamedText: false,
       lastAssistantText: 'Here is my analysis of the code...',
     };
@@ -354,7 +835,7 @@ describe('catch block error suppression logic', () => {
   });
 
   it('no streaming + no assistant text → should show full error', () => {
-    const state: StreamState = { hasReceivedResult: false, hasStreamedText: false, lastAssistantText: '' };
+    const state: StreamState = { hasReceivedResult: false, hasReachedEndTurn: false, hasStreamedText: false, lastAssistantText: '' };
 
     const shouldSurface = !!state.lastAssistantText && classifyAuthError(state.lastAssistantText) !== false;
     const shouldSuppress = state.hasReceivedResult;
@@ -366,10 +847,38 @@ describe('catch block error suppression logic', () => {
   it('streaming + result + exit code → should suppress', () => {
     // Normal successful flow that ends with exit code 0 won't throw,
     // but some edge cases might. Verify suppression.
-    const state: StreamState = { hasReceivedResult: true, hasStreamedText: true, lastAssistantText: 'some response' };
+    const state: StreamState = { hasReceivedResult: true, hasReachedEndTurn: false, hasStreamedText: true, lastAssistantText: 'some response' };
     const isTransportExit = true;
 
     const shouldSuppress = state.hasReceivedResult && isTransportExit;
     assert.equal(shouldSuppress, true);
+  });
+
+  it('top-level end_turn + transport exit → should complete from the terminal response', () => {
+    const state: StreamState = {
+      hasReceivedResult: false,
+      hasReachedEndTurn: true,
+      hasStreamedText: true,
+      lastAssistantHadCompletableText: true,
+      lastAssistantText: 'complete response',
+    };
+    assert.equal(
+      shouldSuppressCompletedTransportExit(state, 'Claude Code process exited with code 1'),
+      true,
+    );
+  });
+
+  it('empty terminal candidate + transport exit → should surface the failure', () => {
+    const state: StreamState = {
+      hasReceivedResult: false,
+      hasReachedEndTurn: true,
+      hasStreamedText: false,
+      lastAssistantHadCompletableText: false,
+      lastAssistantText: '',
+    };
+    assert.equal(
+      shouldSuppressCompletedTransportExit(state, 'Claude Code process exited with code 1'),
+      false,
+    );
   });
 });

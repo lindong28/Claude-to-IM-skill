@@ -418,8 +418,14 @@ function buildPrompt(
 export interface StreamState {
   /** True once a `result` message (success or error subtype) has been processed. */
   hasReceivedResult: boolean;
+  /** True after a top-level terminal signal (`message_stop` or `end_turn`) until activity resumes. */
+  hasReachedEndTurn: boolean;
   /** True once any text_delta has been emitted via stream_event. */
   hasStreamedText: boolean;
+  /** Whether the latest top-level assistant message requested a tool. */
+  lastAssistantHadToolUse?: boolean;
+  /** Whether the latest top-level assistant record itself contained response text. */
+  lastAssistantHadCompletableText?: boolean;
   /**
    * Full text captured from the final `assistant` message.
    * NOT emitted during normal flow (stream_event deltas handle that).
@@ -449,7 +455,18 @@ export class SDKLLMProvider implements LLMProvider {
           // Ring-buffer for recent stderr output (max 4 KB)
           const MAX_STDERR = 4096;
           let stderrBuf = '';
-          const state: StreamState = { hasReceivedResult: false, hasStreamedText: false, lastAssistantText: '' };
+          const state: StreamState = {
+            hasReceivedResult: false,
+            hasReachedEndTurn: false,
+            hasStreamedText: false,
+            lastAssistantHadToolUse: false,
+            lastAssistantHadCompletableText: false,
+            lastAssistantText: '',
+          };
+          const sdkAbortController = new AbortController();
+          const forwardAbort = () => sdkAbortController.abort(params.abortController?.signal.reason);
+          if (params.abortController?.signal.aborted) forwardAbort();
+          else params.abortController?.signal.addEventListener('abort', forwardAbort, { once: true });
 
           try {
             const cleanEnv = buildSubprocessEnv();
@@ -475,7 +492,7 @@ export class SDKLLMProvider implements LLMProvider {
               cwd: params.workingDirectory,
               model,
               resume: params.sdkSessionId || undefined,
-              abortController: params.abortController,
+              abortController: sdkAbortController,
               permissionMode: (params.permissionMode as 'default' | 'acceptEdits' | 'plan') || undefined,
               includePartialMessages: true,
               env: cleanEnv,
@@ -548,9 +565,7 @@ export class SDKLLMProvider implements LLMProvider {
               options: queryOptions as Parameters<typeof query>[0]['options'],
             });
 
-            for await (const msg of q) {
-              handleMessage(msg, controller, state);
-            }
+            await consumeSdkMessages(q, controller, state, sdkAbortController);
 
             controller.close();
           } catch (err) {
@@ -565,8 +580,15 @@ export class SDKLLMProvider implements LLMProvider {
             // ── Case 1: Result already received ──
             // The SDK delivered a proper result (success or structured error).
             // A trailing "process exited with code 1" is transport teardown noise.
-            if (state.hasReceivedResult && isTransportExit) {
-              console.log('[llm-provider] Suppressing transport error — result already received');
+            if (shouldSuppressCompletedTransportExit(state, message)) {
+              if (!state.hasReceivedResult) {
+                console.warn(
+                  '[llm-provider] SDK transport exited after a top-level terminal signal without a result; ' +
+                  'completing from the final assistant response',
+                );
+                emitEndTurnFallback(controller, state);
+              }
+              console.log('[llm-provider] Suppressing transport error after terminal SDK output');
               controller.close();
               return;
             }
@@ -619,10 +641,128 @@ export class SDKLLMProvider implements LLMProvider {
 
             controller.enqueue(sseEvent('error', userMessage));
             controller.close();
+          } finally {
+            params.abortController?.signal.removeEventListener('abort', forwardAbort);
           }
         })();
       },
     });
+  }
+}
+
+export function shouldSuppressCompletedTransportExit(state: StreamState, message: string): boolean {
+  return message.includes('process exited with code')
+    && (state.hasReceivedResult || (state.hasReachedEndTurn && state.lastAssistantHadCompletableText === true));
+}
+
+function emitEndTurnFallback(
+  controller: ReadableStreamDefaultController<string>,
+  state: StreamState,
+): void {
+  if (!state.hasStreamedText && state.lastAssistantText) {
+    controller.enqueue(sseEvent('text', state.lastAssistantText));
+    state.hasStreamedText = true;
+  }
+}
+
+/** @internal Exported for deterministic regression testing. */
+export async function consumeSdkMessages(
+  messages: AsyncIterable<SDKMessage>,
+  controller: ReadableStreamDefaultController<string>,
+  state: StreamState,
+  abortController: AbortController,
+  endTurnGraceMs = 10_000,
+): Promise<void> {
+  const iterator = messages[Symbol.asyncIterator]();
+
+  const closeIterator = async (): Promise<void> => {
+    if (!iterator.return) return;
+    const cleanupGraceMs = Math.min(1_000, Math.max(25, endTurnGraceMs));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        iterator.return(),
+        new Promise<void>((resolve) => { timer = setTimeout(resolve, cleanupGraceMs); }),
+      ]);
+    } catch {
+      // The abort signal is the primary teardown; iterator.return is best effort.
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+
+  while (true) {
+    const nextPromise = iterator.next();
+    let next: IteratorResult<SDKMessage>;
+    let isPostAbortDrain = false;
+
+    if (state.hasReachedEndTurn && !state.hasReceivedResult) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), endTurnGraceMs);
+      });
+      const outcome = await Promise.race([nextPromise, timeout]);
+      if (timer) clearTimeout(timer);
+
+      if (outcome === null) {
+        abortController.abort('SDK result timeout after end_turn');
+        const cleanupGraceMs = Math.min(1_000, Math.max(25, endTurnGraceMs));
+        let drainTimer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const drained = await Promise.race([
+            nextPromise,
+            new Promise<null>((resolve) => {
+              drainTimer = setTimeout(() => resolve(null), cleanupGraceMs);
+            }),
+          ]);
+          if (drainTimer) clearTimeout(drainTimer);
+          if (drained !== null) {
+            next = drained;
+            isPostAbortDrain = true;
+          } else {
+            console.warn(
+              `[llm-provider] SDK did not emit a result within ${endTurnGraceMs}ms after a top-level terminal signal; ` +
+              'completing from the final assistant response',
+            );
+            void nextPromise.catch(() => undefined);
+            await closeIterator();
+            emitEndTurnFallback(controller, state);
+            return;
+          }
+        } catch {
+          if (drainTimer) clearTimeout(drainTimer);
+          console.warn(
+            '[llm-provider] SDK transport stopped after a top-level terminal signal without a result; ' +
+            'completing from the final assistant response',
+          );
+          await closeIterator();
+          emitEndTurnFallback(controller, state);
+          return;
+        }
+      } else {
+        next = outcome;
+      }
+    } else {
+      next = await nextPromise;
+    }
+
+    if (next.done) {
+      if (state.hasReachedEndTurn && !state.hasReceivedResult) {
+        console.warn(
+          '[llm-provider] SDK stream ended without a result after end_turn; ' +
+          'completing from the final assistant response',
+        );
+        emitEndTurnFallback(controller, state);
+      }
+      await closeIterator();
+      return;
+    }
+
+    handleMessage(next.value, controller, state);
+    if (isPostAbortDrain && state.hasReceivedResult) {
+      await closeIterator();
+      return;
+    }
   }
 }
 
@@ -632,10 +772,18 @@ export function handleMessage(
   controller: ReadableStreamDefaultController<string>,
   state: StreamState,
 ): void {
+  if (msg.type !== 'result' && state.hasReachedEndTurn) {
+    state.hasReachedEndTurn = false;
+  }
+  const parentToolUseId = 'parent_tool_use_id' in msg
+    ? msg.parent_tool_use_id
+    : null;
+  const isSubagentMessage = Boolean(parentToolUseId);
+
   switch (msg.type) {
     case 'stream_event': {
       const event = msg.event;
-      if (
+      if (!isSubagentMessage &&
         event.type === 'content_block_delta' &&
         event.delta.type === 'text_delta'
       ) {
@@ -655,10 +803,24 @@ export function handleMessage(
           }),
         );
       }
+      if (event.type === 'message_stop') {
+        if (!isSubagentMessage) {
+          state.hasReachedEndTurn = state.lastAssistantHadToolUse !== true
+            && state.lastAssistantHadCompletableText === true;
+        }
+      }
       break;
     }
 
     case 'assistant': {
+      const hasToolUse = msg.message?.content?.some(
+        (block: { type?: string }) => block.type === 'tool_use',
+      ) ?? false;
+      if (!isSubagentMessage) {
+        state.lastAssistantHadToolUse = hasToolUse;
+        state.lastAssistantHadCompletableText = false;
+        state.lastAssistantText = '';
+      }
       // Full assistant message — capture text but do NOT emit it.
       // Text deltas are already streamed via stream_event above; emitting
       // the full text block here would duplicate the entire response.
@@ -667,9 +829,10 @@ export function handleMessage(
       // errors (e.g. "Your organization does not have access") that the
       // CLI returned as assistant text without prior streaming deltas.
       if (msg.message?.content) {
+        const assistantText: string[] = [];
         for (const block of msg.message.content) {
-          if (block.type === 'text' && block.text) {
-            state.lastAssistantText += (state.lastAssistantText ? '\n' : '') + block.text;
+          if (!isSubagentMessage && block.type === 'text' && block.text) {
+            assistantText.push(block.text);
           } else if (block.type === 'tool_use') {
             controller.enqueue(
               sseEvent('tool_use', {
@@ -680,6 +843,15 @@ export function handleMessage(
             );
           }
         }
+        if (!isSubagentMessage && assistantText.length > 0) {
+          state.lastAssistantText = assistantText.join('\n');
+          state.lastAssistantHadCompletableText = true;
+        }
+      }
+      if (!isSubagentMessage) {
+        state.hasReachedEndTurn = msg.message?.stop_reason === 'end_turn'
+          && !hasToolUse
+          && state.lastAssistantHadCompletableText === true;
       }
       break;
     }
