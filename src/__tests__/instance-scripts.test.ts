@@ -783,6 +783,79 @@ describe('instance-aware macOS lifecycle scripts', {
 });
 
 describe('portable instance contracts', () => {
+  function createPortableDoctorFixture(): {
+    home: string;
+    namedHome: string;
+    binDir: string;
+    curlLog: string;
+    env: NodeJS.ProcessEnv;
+  } {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cti-doctor-portable-')));
+    const namedHome = path.join(home, '.claude-to-im-portable');
+    const binDir = path.join(home, 'bin');
+    const curlLog = path.join(home, 'curl.log');
+    for (const dir of [binDir, namedHome, ...['data', 'runtime', 'logs'].map((dir) => path.join(namedHome, dir))]) {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      fs.chmodSync(dir, 0o700);
+    }
+    fs.writeFileSync(
+      path.join(binDir, 'stat'),
+      '#!/usr/bin/env bash\n' +
+        'if [ "${CTI_TEST_USE_SYSTEM_STAT:-0}" = "1" ]; then exec /usr/bin/stat "$@"; fi\n' +
+        'if [ "${1:-}" = "-c" ] && [ "${2:-}" = "%a" ] && [ "${CTI_TEST_GNU_MODE_PREFIX:-0}" = "1" ]; then\n' +
+        '  if [ "$(uname -s)" = "Darwin" ]; then mode=$(/usr/bin/stat -f "%Lp" "$3"); else mode=$(/usr/bin/stat -c "%a" "$3"); fi\n' +
+        '  if [[ "$3" = */config.env ]]; then printf "%s\\n" "$mode"; else printf "1%s\\n" "${mode: -3}"; fi\n' +
+        '  exit 0\n' +
+        'fi\n' +
+        'if [ "${1:-}" = "-f" ]; then\n' +
+        '  printf \'  File: "%s"\\n    ID: fake Namelen: 255 Type: test\\nBlock size: 4096\n\' "${3:-${2:-}}"\n' +
+        '  exit 0\n' +
+        'fi\n' +
+        'if [ "${1:-}" = "-c" ] && [ "$(uname -s)" = "Darwin" ]; then\n' +
+        '  format="$2"\n' +
+        '  shift 2\n' +
+        '  [ "$format" != "%a" ] || format="%Lp"\n' +
+        '  exec /usr/bin/stat -f "$format" "$@"\n' +
+        'fi\n' +
+        'exec /usr/bin/stat "$@"\n',
+      { mode: 0o700 },
+    );
+    fs.writeFileSync(
+      path.join(binDir, 'curl'),
+      '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$CTI_TEST_CURL_LOG"\nprintf \'{"code":0}\'\n',
+      { mode: 0o700 },
+    );
+    return {
+      home,
+      namedHome,
+      binDir,
+      curlLog,
+      env: {
+        HOME: home,
+        PATH: `${binDir}:${process.env.PATH}`,
+        CTI_HOME: namedHome,
+        CTI_INSTANCE: 'portable',
+        CTI_TEST_CURL_LOG: curlLog,
+      },
+    };
+  }
+
+  function writePortableDoctorConfig(namedHome: string, domain?: string): void {
+    const lines = [
+      'CTI_RUNTIME=codex',
+      'CTI_ENABLED_CHANNELS=feishu',
+      'CTI_FEISHU_APP_ID=test-app',
+      'CTI_FEISHU_APP_SECRET=test-secret',
+      'CTI_FEISHU_ALLOWED_USERS=test-user',
+      'CTI_FEISHU_GROUP_ALLOW_FROM=test-group',
+      'CTI_FEISHU_GROUP_POLICY=allowlist',
+      'CTI_FEISHU_REQUIRE_MENTION=true',
+    ];
+    if (domain !== undefined) lines.push(`CTI_FEISHU_DOMAIN=${domain}`);
+    fs.writeFileSync(path.join(namedHome, 'config.env'), `${lines.join('\n')}\n`, { mode: 0o600 });
+    fs.chmodSync(path.join(namedHome, 'config.env'), 0o600);
+  }
+
   it('keeps the Linux default-home contract and exposes a safe uninstall hook', () => {
     const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cti-instance-portable-')));
     try {
@@ -812,5 +885,199 @@ describe('portable instance contracts', () => {
     const script = fs.readFileSync(path.join(SCRIPTS_DIR, 'supervisor-windows.ps1'), 'utf8');
     assert.match(script, /\$CtiHome\s*=\s*if \(\$env:CTI_HOME\).*\.claude-to-im/);
     assert.match(script, /\$ServiceName\s*=\s*'ClaudeToIMBridge'/);
+  });
+
+  it('rejects an extra directory mode bit while surviving GNU stat -f filesystem output', () => {
+    const fixture = createPortableDoctorFixture();
+    try {
+      writePortableDoctorConfig(fixture.namedHome, 'feishu');
+      let result = spawnSync('/bin/bash', [path.join(SCRIPTS_DIR, 'doctor.sh')], {
+        env: { ...process.env, ...fixture.env, CTI_TEST_GNU_MODE_PREFIX: '1' },
+        encoding: 'utf8',
+      });
+      let output = `${result.stdout}${result.stderr}`;
+      assert.match(output, /\[FAIL\]\s+Named instance home permissions are 700 \(currently 1700\)/);
+      assert.match(output, /\[OK\]\s+config\.env permissions are 600/);
+      assert.doesNotMatch(output, /Block size: 4096/);
+
+      fs.chmodSync(fixture.namedHome, 0o1700);
+      result = spawnSync('/bin/bash', [path.join(SCRIPTS_DIR, 'doctor.sh')], {
+        env: { ...process.env, ...fixture.env, CTI_TEST_USE_SYSTEM_STAT: '1' },
+        encoding: 'utf8',
+      });
+      output = `${result.stdout}${result.stderr}`;
+      assert.match(output, /\[FAIL\]\s+Named instance home permissions are 700 \(currently 1700\)/);
+      assert.match(output, /\[OK\]\s+config\.env permissions are 600/);
+    } finally {
+      fs.rmSync(fixture.home, { recursive: true, force: true });
+    }
+  });
+
+  it('uses object identities instead of GNU stat -f filesystem output during stale-lock repair', () => {
+    const fixture = createPortableDoctorFixture();
+    const lockRoot = path.join(fixture.home, '.claude-to-im-lifecycle-locks');
+    const lockKey = crypto.createHash('sha256').update(fixture.namedHome).digest('hex');
+    const lockPath = path.join(lockRoot, `${lockKey}.lock`);
+    try {
+      fs.mkdirSync(lockPath, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(lockPath, 'owner'), '99999999\nportable\n', { mode: 0o600 });
+      fs.writeFileSync(
+        path.join(fixture.binDir, 'rm'),
+        '#!/usr/bin/env bash\n' +
+          '/bin/mv "$CTI_TEST_LOCK_PATH" "$CTI_TEST_LOCK_PATH.moved"\n' +
+          '/bin/mkdir "$CTI_TEST_LOCK_PATH"\n' +
+          'exec /bin/rm "$@"\n',
+        { mode: 0o700 },
+      );
+
+      const result = spawnSync(
+        '/bin/bash',
+        [path.join(SCRIPTS_DIR, 'doctor.sh'), '--repair-stale-lock'],
+        {
+          env: { ...process.env, ...fixture.env, CTI_TEST_LOCK_PATH: lockPath },
+          encoding: 'utf8',
+        },
+      );
+      assert.notEqual(result.status, 0);
+      assert.match(`${result.stdout}${result.stderr}`, /Refusing lifecycle-lock repair/);
+      assert.equal(fs.existsSync(lockPath), true);
+    } finally {
+      fs.rmSync(fixture.home, { recursive: true, force: true });
+    }
+  });
+
+  it('successfully removes an unchanged stale lock through the validated identity path', () => {
+    const fixture = createPortableDoctorFixture();
+    const lockRoot = path.join(fixture.home, '.claude-to-im-lifecycle-locks');
+    const lockKey = crypto.createHash('sha256').update(fixture.namedHome).digest('hex');
+    const lockPath = path.join(lockRoot, `${lockKey}.lock`);
+    try {
+      fs.mkdirSync(lockPath, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(lockPath, 'owner'), '99999999\nportable\n', { mode: 0o600 });
+      const result = spawnSync(
+        '/bin/bash',
+        [path.join(SCRIPTS_DIR, 'doctor.sh'), '--repair-stale-lock'],
+        { env: { ...process.env, ...fixture.env }, encoding: 'utf8' },
+      );
+      assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
+      assert.match(`${result.stdout}${result.stderr}`, /Removed verified stale lifecycle lock/);
+      assert.equal(fs.existsSync(lockPath), false);
+    } finally {
+      fs.rmSync(fixture.home, { recursive: true, force: true });
+    }
+  });
+
+  it('maps Feishu domain tokens to the same REST origins as the adapter', () => {
+    const fixture = createPortableDoctorFixture();
+    try {
+      for (const [domain, expectedOrigin] of [
+        ['lark', 'https://open.larksuite.com'],
+        ['feishu', 'https://open.feishu.cn'],
+        [undefined, 'https://open.feishu.cn'],
+      ] as const) {
+        writePortableDoctorConfig(fixture.namedHome, domain);
+        fs.rmSync(fixture.curlLog, { force: true });
+        const result = spawnSync('/bin/bash', [path.join(SCRIPTS_DIR, 'doctor.sh')], {
+          env: { ...process.env, ...fixture.env },
+          encoding: 'utf8',
+        });
+        const output = `${result.stdout}${result.stderr}`;
+        const curlLog = fs.readFileSync(fixture.curlLog, 'utf8');
+        assert.match(output, /\[OK\]\s+CTI_FEISHU_DOMAIN is lark, feishu, or unset/);
+        assert.match(output, /\[OK\]\s+Feishu app credentials are valid/);
+        assert.match(curlLog, new RegExp(`${escapeRegex(expectedOrigin)}/open-apis/auth/v3/tenant_access_token/internal`));
+        assert.doesNotMatch(curlLog, /(?:^|\s)(?:lark|feishu)\/open-apis/);
+      }
+
+      for (const invalidDomain of ['https://open.larksuite.com', 'international']) {
+        writePortableDoctorConfig(fixture.namedHome, invalidDomain);
+        fs.rmSync(fixture.curlLog, { force: true });
+        const result = spawnSync('/bin/bash', [path.join(SCRIPTS_DIR, 'doctor.sh')], {
+          env: { ...process.env, ...fixture.env },
+          encoding: 'utf8',
+        });
+        const output = `${result.stdout}${result.stderr}`;
+        const curlLog = fs.readFileSync(fixture.curlLog, 'utf8');
+        assert.match(output, /\[FAIL\]\s+CTI_FEISHU_DOMAIN is lark, feishu, or unset/);
+        assert.match(curlLog, /https:\/\/open\.feishu\.cn\/open-apis\/auth\/v3\/tenant_access_token\/internal/);
+        assert.doesNotMatch(curlLog, /open\.larksuite\.com/);
+      }
+    } finally {
+      fs.rmSync(fixture.home, { recursive: true, force: true });
+    }
+  });
+
+  it('matches config.ts whitespace trimming and last-key-wins semantics', () => {
+    const fixture = createPortableDoctorFixture();
+    try {
+      writePortableDoctorConfig(fixture.namedHome, '  lark  ');
+      let result = spawnSync('/bin/bash', [path.join(SCRIPTS_DIR, 'doctor.sh')], {
+        env: { ...process.env, ...fixture.env },
+        encoding: 'utf8',
+      });
+      assert.match(`${result.stdout}${result.stderr}`, /\[OK\]\s+CTI_FEISHU_DOMAIN is lark, feishu, or unset/);
+      assert.match(fs.readFileSync(fixture.curlLog, 'utf8'), /https:\/\/open\.larksuite\.com\/open-apis/);
+
+      writePortableDoctorConfig(fixture.namedHome, 'lark');
+      fs.appendFileSync(fixture.namedHome + '/config.env', 'CTI_FEISHU_DOMAIN=feishu\n');
+      fs.rmSync(fixture.curlLog, { force: true });
+      result = spawnSync('/bin/bash', [path.join(SCRIPTS_DIR, 'doctor.sh')], {
+        env: { ...process.env, ...fixture.env },
+        encoding: 'utf8',
+      });
+      assert.match(`${result.stdout}${result.stderr}`, /\[OK\]\s+CTI_FEISHU_DOMAIN is lark, feishu, or unset/);
+      assert.match(fs.readFileSync(fixture.curlLog, 'utf8'), /https:\/\/open\.feishu\.cn\/open-apis/);
+    } finally {
+      fs.rmSync(fixture.home, { recursive: true, force: true });
+    }
+  });
+
+  it('documents CTI_FEISHU_DOMAIN as the runtime enum instead of a URL', () => {
+    const example = fs.readFileSync(path.join(SKILL_DIR, 'config.env.example'), 'utf8');
+    assert.match(example, /Domain selector: lark for international Lark tenants; feishu or unset for Feishu CN/i);
+    assert.match(example, /CTI_FEISHU_DOMAIN=lark/);
+    assert.doesNotMatch(example, /CTI_FEISHU_DOMAIN=https?:\/\//);
+  });
+
+  it('runs the repository installer contract when GNU stat -f returns filesystem output', () => {
+    const fixture = createPortableDoctorFixture();
+    try {
+      const tempRoot = path.join(fixture.home, 'repo');
+      const tempScripts = path.join(tempRoot, 'claude', 'skills', 'claude-to-im', 'scripts');
+      fs.mkdirSync(tempScripts, { recursive: true });
+      for (const script of ['install-from-repo.test.sh', 'install-from-repo.sh', 'instance-env.sh']) {
+        fs.copyFileSync(path.join(SCRIPTS_DIR, script), path.join(tempScripts, script));
+      }
+      fs.writeFileSync(
+        path.join(tempRoot, 'install.sh'),
+        'claude/skills/claude-to-im/scripts/install-from-repo.sh\n' +
+          'skill-configs/*/instances/*/config.env\n',
+      );
+      const result = spawnSync('/bin/bash', [path.join(tempScripts, 'install-from-repo.test.sh')], {
+        cwd: tempRoot,
+        env: { ...process.env, PATH: `${fixture.binDir}:${process.env.PATH}` },
+        encoding: 'utf8',
+      });
+      assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
+      assert.match(`${result.stdout}${result.stderr}`, /ok - claude-to-im repository installer boundary/);
+    } finally {
+      fs.rmSync(fixture.home, { recursive: true, force: true });
+    }
+  });
+
+  it('reports a missing config.env through the full doctor contract', () => {
+    const fixture = createPortableDoctorFixture();
+    try {
+      const result = spawnSync('/bin/bash', [path.join(SCRIPTS_DIR, 'doctor.sh')], {
+        env: { ...process.env, ...fixture.env },
+        encoding: 'utf8',
+      });
+      const output = `${result.stdout}${result.stderr}`;
+      assert.equal(result.status, 1, output);
+      assert.match(output, /\[FAIL\]\s+config\.env exists/);
+      assert.match(output, /Results:/);
+    } finally {
+      fs.rmSync(fixture.home, { recursive: true, force: true });
+    }
   });
 });

@@ -45,8 +45,58 @@ lifecycle_lock_path() {
   printf '%s/.claude-to-im-lifecycle-locks/%s.lock\n' "$CTI_HOME_ROOT" "$lock_key"
 }
 
+validated_stat() {
+  local gnu_format="$1"
+  local bsd_format="$2"
+  local pattern="$3"
+  local path="$4"
+  local value
+
+  value=$(stat -c "$gnu_format" "$path" 2>/dev/null || true)
+  if [[ "$value" =~ $pattern ]]; then
+    printf '%s\n' "$value"
+    return 0
+  fi
+
+  value=$(stat -f "$bsd_format" "$path" 2>/dev/null || true)
+  if [[ "$value" =~ $pattern ]]; then
+    printf '%s\n' "$value"
+    return 0
+  fi
+
+  return 1
+}
+
 stat_identity() {
-  stat -f '%d:%i' "$1" 2>/dev/null || stat -c '%d:%i' "$1" 2>/dev/null
+  validated_stat '%d:%i' '%d:%i' '^[0-9]+:[0-9]+$' "$1"
+}
+
+stat_mode() {
+  local value
+  value=$(stat -c '%a' "$1" 2>/dev/null || true)
+  if [[ "$value" =~ ^[0-7]{3}$ ]]; then
+    printf '0%s\n' "$value"
+    return 0
+  fi
+  if [[ "$value" =~ ^[0-7]{4}$ ]]; then
+    printf '%s\n' "$value"
+    return 0
+  fi
+
+  value=$(stat -f '%p' "$1" 2>/dev/null || true)
+  if [[ "$value" =~ ^[0-7]{5,7}$ ]]; then
+    printf '%s\n' "${value: -4}"
+    return 0
+  fi
+  return 1
+}
+
+feishu_api_origin() {
+  if [ "${1:-}" = "lark" ]; then
+    printf '%s\n' 'https://open.larksuite.com'
+  else
+    printf '%s\n' 'https://open.feishu.cn'
+  fi
 }
 
 repair_stale_lifecycle_lock() (
@@ -168,8 +218,33 @@ fi
 
 # --- Helper: read a value from config.env ---
 get_config() {
-  { grep "^$1=" "$CONFIG_FILE" 2>/dev/null || true; } \
-    | head -1 | cut -d= -f2- | sed 's/^["'"'"']//;s/["'"'"']$//'
+  [ -r "$CONFIG_FILE" ] || return 0
+  awk -v target="$1" '
+    function trim(value) {
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      return value
+    }
+    {
+      line = trim($0)
+      if (line == "" || substr(line, 1, 1) == "#") next
+      separator = index(line, "=")
+      if (separator == 0) next
+      key = trim(substr(line, 1, separator - 1))
+      if (key != target) next
+      value = trim(substr(line, separator + 1))
+      first = substr(value, 1, 1)
+      last = substr(value, length(value), 1)
+      if (length(value) >= 2 && ((first == "\"" && last == "\"") || (first == "\047" && last == "\047"))) {
+        value = substr(value, 2, length(value) - 2)
+      }
+      found = 1
+      result = value
+    }
+    END {
+      if (found) printf "%s", result
+    }
+  ' "$CONFIG_FILE" 2>/dev/null || true
 }
 
 # --- Read runtime setting ---
@@ -339,8 +414,8 @@ fi
 
 # --- Named-instance private persistence boundary ---
 if [ "$CTI_INSTANCE" != "default" ]; then
-  HOME_PERMS=$(stat -f "%Lp" "$CTI_HOME" 2>/dev/null || stat -c "%a" "$CTI_HOME" 2>/dev/null || echo "missing")
-  if [ "$HOME_PERMS" = "700" ]; then
+  HOME_PERMS=$(stat_mode "$CTI_HOME" || echo "missing")
+  if [ "$HOME_PERMS" = "0700" ]; then
     check "Named instance home permissions are 700" 0
   else
     check "Named instance home permissions are 700 (currently $HOME_PERMS)" 1
@@ -474,8 +549,8 @@ fi
 
 # --- config.env permissions ---
 if [ -f "$CONFIG_FILE" ]; then
-  PERMS=$(stat -f "%Lp" "$CONFIG_FILE" 2>/dev/null || stat -c "%a" "$CONFIG_FILE" 2>/dev/null || echo "unknown")
-  if [ "$PERMS" = "600" ]; then
+  PERMS=$(stat_mode "$CONFIG_FILE" || echo "unknown")
+  if [ "$PERMS" = "0600" ]; then
     check "config.env permissions are 600" 0
   else
     check "config.env permissions are 600 (currently $PERMS)" 1
@@ -506,11 +581,16 @@ if [ -f "$CONFIG_FILE" ]; then
     FS_APP_ID=$(get_config CTI_FEISHU_APP_ID)
     FS_SECRET=$(get_config CTI_FEISHU_APP_SECRET)
     FS_DOMAIN=$(get_config CTI_FEISHU_DOMAIN)
-    FS_DOMAIN="${FS_DOMAIN:-https://open.feishu.cn}"
+    FS_API_ORIGIN=$(feishu_api_origin "$FS_DOMAIN")
     FS_GROUP_POLICY=$(get_config CTI_FEISHU_GROUP_POLICY)
     FS_REQUIRE_MENTION=$(get_config CTI_FEISHU_REQUIRE_MENTION)
     FS_ALLOWED_USERS=$(get_config CTI_FEISHU_ALLOWED_USERS)
     FS_ALLOWED_GROUPS=$(get_config CTI_FEISHU_GROUP_ALLOW_FROM)
+
+    case "$FS_DOMAIN" in
+      ""|lark|feishu) check "CTI_FEISHU_DOMAIN is lark, feishu, or unset" 0 ;;
+      *) check "CTI_FEISHU_DOMAIN is lark, feishu, or unset" 1 ;;
+    esac
 
     if [ "$CTI_INSTANCE" != "default" ]; then
     if [ "$FS_GROUP_POLICY" = "allowlist" ]; then
@@ -552,7 +632,7 @@ if [ -f "$CONFIG_FILE" ]; then
     fi
     fi
     if [ -n "$FS_APP_ID" ] && [ -n "$FS_SECRET" ]; then
-      FEISHU_RESULT=$(curl -s --max-time 5 -X POST "${FS_DOMAIN}/open-apis/auth/v3/tenant_access_token/internal" \
+      FEISHU_RESULT=$(curl -s --max-time 5 -X POST "${FS_API_ORIGIN}/open-apis/auth/v3/tenant_access_token/internal" \
         -H "Content-Type: application/json" \
         -d "{\"app_id\":\"${FS_APP_ID}\",\"app_secret\":\"${FS_SECRET}\"}" 2>/dev/null || echo '{"code":1}')
       if echo "$FEISHU_RESULT" | grep -q '"code"[[:space:]]*:[[:space:]]*0'; then

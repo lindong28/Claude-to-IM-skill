@@ -25,6 +25,26 @@ assert_not_contains() {
   fi
 }
 
+stat_mode() {
+  local value
+  value=$(stat -c '%a' "$1" 2>/dev/null || true)
+  if [[ "$value" =~ ^[0-7]{3}$ ]]; then
+    printf '0%s\n' "$value"
+    return 0
+  fi
+  if [[ "$value" =~ ^[0-7]{4}$ ]]; then
+    printf '%s\n' "$value"
+    return 0
+  fi
+
+  value=$(stat -f '%p' "$1" 2>/dev/null || true)
+  if [[ "$value" =~ ^[0-7]{5,7}$ ]]; then
+    printf '%s\n' "${value: -4}"
+    return 0
+  fi
+  return 1
+}
+
 test_root_is_orchestration_only() {
   local root_installer="$REPO_ROOT/install.sh"
 
@@ -233,9 +253,9 @@ EOF
   [ -f "$target_config" ] || fail "tracked named config was not materialized"
   [ "$(cat "$marker")" = "$(shasum -a 256 "$target_config" | awk '{print $1}')" ] \
     || fail "deployed marker does not identify the exact runtime config snapshot"
-  [ "$(stat -f '%Lp' "$sandbox/home/.claude-to-im-quant-lab")" = "700" ] \
+  [ "$(stat_mode "$sandbox/home/.claude-to-im-quant-lab")" = "0700" ] \
     || fail "named instance home is not mode 700"
-  [ "$(stat -f '%Lp' "$target_config")" = "600" ] \
+  [ "$(stat_mode "$target_config")" = "0600" ] \
     || fail "materialized named config is not mode 600"
   [ -s "$marker" ] || fail "successful deployment did not record the deployed config hash"
   [ ! -e "$pending" ] || fail "successful deployment left a convergence-pending marker"
