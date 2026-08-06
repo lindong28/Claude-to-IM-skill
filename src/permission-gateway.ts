@@ -17,7 +17,7 @@ export interface PermissionResolution {
 export class PendingPermissions {
   private pending = new Map<string, {
     resolve: (r: PermissionResult) => void;
-    timer: NodeJS.Timeout;
+    timer?: NodeJS.Timeout;
   }>();
   private timeoutMs = 5 * 60 * 1000; // 5 minutes
 
@@ -32,7 +32,11 @@ export class PendingPermissions {
   }
 
   waitForQuestion(toolUseID: string): Promise<PermissionResult> {
-    return this.waitFor(toolUseID);
+    // QuestionBroker owns the single question wait deadline so its durable
+    // state, visible fallback, and provider-side release happen atomically.
+    return new Promise((resolve) => {
+      this.pending.set(toolUseID, { resolve });
+    });
   }
 
   resolveQuestion(
@@ -44,7 +48,7 @@ export class PendingPermissions {
   ): boolean {
     const entry = this.pending.get(questionRequestId);
     if (!entry) return false;
-    clearTimeout(entry.timer);
+    if (entry.timer) clearTimeout(entry.timer);
     entry.resolve({ behavior: 'allow', updatedInput });
     this.pending.delete(questionRequestId);
     return true;
@@ -53,7 +57,7 @@ export class PendingPermissions {
   resolve(permissionRequestId: string, resolution: PermissionResolution): boolean {
     const entry = this.pending.get(permissionRequestId);
     if (!entry) return false;
-    clearTimeout(entry.timer);
+    if (entry.timer) clearTimeout(entry.timer);
     if (resolution.behavior === 'allow') {
       entry.resolve({ behavior: 'allow' });
     } else {
@@ -65,7 +69,7 @@ export class PendingPermissions {
 
   denyAll(): void {
     for (const [, entry] of this.pending) {
-      clearTimeout(entry.timer);
+      if (entry.timer) clearTimeout(entry.timer);
       entry.resolve({ behavior: 'deny', message: 'Bridge shutting down' });
     }
     this.pending.clear();

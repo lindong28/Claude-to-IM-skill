@@ -1039,6 +1039,53 @@ describe('portable instance contracts', () => {
     assert.doesNotMatch(example, /CTI_FEISHU_DOMAIN=https?:\/\//);
   });
 
+  it('validates and reports the configured question-card wait', () => {
+    const fixture = createPortableDoctorFixture();
+    try {
+      writePortableDoctorConfig(fixture.namedHome, 'feishu');
+      const configPath = path.join(fixture.namedHome, 'config.env');
+      fs.appendFileSync(configPath, 'CTI_QUESTION_CARD_WAIT_SECONDS=3600\n');
+      let result = spawnSync('/bin/bash', [path.join(SCRIPTS_DIR, 'doctor.sh')], {
+        env: { ...process.env, ...fixture.env },
+        encoding: 'utf8',
+      });
+      assert.doesNotMatch(`${result.stdout}${result.stderr}`, /Question cards wait|CTI_QUESTION_CARD_WAIT_SECONDS/);
+
+      fs.writeFileSync(
+        configPath,
+        fs.readFileSync(configPath, 'utf8').replace('CTI_RUNTIME=codex', 'CTI_RUNTIME=claude'),
+        { mode: 0o600 },
+      );
+      result = spawnSync('/bin/bash', [path.join(SCRIPTS_DIR, 'doctor.sh')], {
+        env: { ...process.env, ...fixture.env },
+        encoding: 'utf8',
+      });
+      assert.match(`${result.stdout}${result.stderr}`, /\[OK\]\s+Question cards wait 3600 seconds before text fallback; outer expiry is 86400 seconds/);
+
+      fs.appendFileSync(configPath, 'CTI_QUESTION_CARD_WAIT_SECONDS=0\n');
+      result = spawnSync('/bin/bash', [path.join(SCRIPTS_DIR, 'doctor.sh')], {
+        env: { ...process.env, ...fixture.env },
+        encoding: 'utf8',
+      });
+      assert.match(`${result.stdout}${result.stderr}`, /\[FAIL\]\s+CTI_QUESTION_CARD_WAIT_SECONDS is an integer from 1 to 86400/);
+    } finally {
+      fs.rmSync(fixture.home, { recursive: true, force: true });
+    }
+  });
+
+  it('documents the question-card wait and /stop escape in setup guidance', () => {
+    const guide = fs.readFileSync(path.join(SKILL_DIR, 'references', 'setup-guides.md'), 'utf8');
+    const example = fs.readFileSync(path.join(SKILL_DIR, 'config.env.example'), 'utf8');
+    const readme = fs.readFileSync(path.join(SKILL_DIR, 'README.md'), 'utf8');
+    assert.match(guide, /CTI_QUESTION_CARD_WAIT_SECONDS=3600/);
+    assert.match(example, /CTI_QUESTION_CARD_WAIT_SECONDS=3600/);
+    assert.doesNotMatch(example, /CTI_QUESTION_CARD_WAIT_SECONDS=86400/);
+    assert.match(readme, /strictly less than the question's remaining outer-expiry time/i);
+    assert.match(readme, /after a restart.*remaining time.*expire instead of fallback/i);
+    assert.match(readme, /persisted text fallback.*reposted once.*expires.*next restart/i);
+    assert.match(guide, /\/stop.*closes all pending questions.*releases all provider waits.*next message.*new instruction/i);
+  });
+
   it('reports effective persisted Claude binding modes and fixed overrides without changing them', () => {
     const fixture = createPortableDoctorFixture();
     try {

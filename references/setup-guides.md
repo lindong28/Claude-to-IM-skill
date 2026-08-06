@@ -227,6 +227,10 @@ Default: `https://open.feishu.cn`
 Use `https://open.larksuite.com` for Lark (international version).
 Leave empty to use the default Feishu domain.
 
+### AskUserQuestion wait (optional)
+
+Set `CTI_QUESTION_CARD_WAIT_SECONDS=3600` to move a sent question to a visible text fallback after one hour, provided that wait is strictly shorter than the question's remaining 24-hour outer-expiry time. Otherwise the question expires with a terminal notice. Because remaining time decreases across daemon restarts, a configured wait such as 43200 seconds will expire rather than fall back when only six hours remain. A persisted text fallback is reposted once after restart and expires with a terminal notice on the next restart. `/stop` closes all pending questions, releases all provider waits, and makes the next message a new instruction.
+
 ### Allowed User IDs (optional)
 
 Feishu user IDs (open_id format like `ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`).

@@ -25,6 +25,7 @@ export interface Config {
   feishuGroupPolicy?: 'open' | 'allowlist' | 'disabled';
   feishuGroupAllowFrom?: string[];
   feishuRequireMention?: boolean;
+  questionCardWaitSeconds?: number;
   sessionPolicy?: 'fixed-confirm-recovery';
   codexSandboxMode?: SandboxMode;
   codexApprovalPolicy?: ApprovalMode;
@@ -107,6 +108,13 @@ function parseFixedMode(value: string | undefined): Config['fixedMode'] {
   throw new Error('Configuration error: CTI_FIXED_MODE must be code, plan, or ask');
 }
 
+function parseQuestionCardWaitSeconds(value: string | undefined): number | undefined {
+  if (value === undefined || value === '') return undefined;
+  const seconds = Number(value);
+  if (Number.isInteger(seconds) && seconds >= 1 && seconds <= 86_400) return seconds;
+  throw new Error('Configuration error: CTI_QUESTION_CARD_WAIT_SECONDS must be an integer from 1 to 86400');
+}
+
 function parseCodexSandboxMode(value: string | undefined): Config['codexSandboxMode'] {
   if (value === undefined || value === '') return undefined;
   if (value === 'read-only' || value === 'workspace-write' || value === 'danger-full-access') return value;
@@ -163,6 +171,7 @@ export function loadConfig(): Config {
       "CTI_FEISHU_REQUIRE_MENTION",
       env.get("CTI_FEISHU_REQUIRE_MENTION"),
     ),
+    questionCardWaitSeconds: parseQuestionCardWaitSeconds(env.get('CTI_QUESTION_CARD_WAIT_SECONDS')),
     sessionPolicy: parseSessionPolicy(env.get("CTI_SESSION_POLICY")),
     codexSandboxMode: parseCodexSandboxMode(env.get('CTI_CODEX_SANDBOX_MODE')),
     codexApprovalPolicy: parseCodexApprovalPolicy(env.get('CTI_CODEX_APPROVAL_POLICY')),
@@ -260,6 +269,8 @@ export function saveConfig(config: Config): void {
   );
   if (config.feishuRequireMention !== undefined)
     out += formatEnvLine("CTI_FEISHU_REQUIRE_MENTION", String(config.feishuRequireMention));
+  if (config.questionCardWaitSeconds !== undefined)
+    out += formatEnvLine('CTI_QUESTION_CARD_WAIT_SECONDS', String(config.questionCardWaitSeconds));
   out += formatEnvLine("CTI_SESSION_POLICY", config.sessionPolicy);
   out += formatEnvLine('CTI_CODEX_SANDBOX_MODE', config.codexSandboxMode);
   out += formatEnvLine('CTI_CODEX_APPROVAL_POLICY', config.codexApprovalPolicy);
@@ -379,6 +390,8 @@ export function configToSettings(config: Config): Map<string, string> {
     m.set("bridge_feishu_group_allow_from", config.feishuGroupAllowFrom.join(","));
   if (config.feishuRequireMention !== undefined)
     m.set("bridge_feishu_require_mention", String(config.feishuRequireMention));
+  if (config.questionCardWaitSeconds !== undefined)
+    m.set('bridge_question_card_wait_seconds', String(config.questionCardWaitSeconds));
   if (config.sessionPolicy)
     m.set("bridge_session_policy", config.sessionPolicy);
 

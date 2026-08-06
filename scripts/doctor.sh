@@ -257,6 +257,24 @@ CTI_RUNTIME="${CTI_RUNTIME:-claude}"
 echo "Runtime: $CTI_RUNTIME"
 echo ""
 
+# --- AskUserQuestion wait policy (Claude runtime only) ---
+if [ "$CTI_RUNTIME" = "claude" ] || [ "$CTI_RUNTIME" = "auto" ]; then
+  QUESTION_CARD_WAIT_SECONDS=$(get_config CTI_QUESTION_CARD_WAIT_SECONDS)
+  if [ -z "$QUESTION_CARD_WAIT_SECONDS" ]; then
+    check "Question cards wait until the 86400-second outer expiry" 0
+  elif [[ "$QUESTION_CARD_WAIT_SECONDS" =~ ^[0-9]+$ ]] \
+    && [ "$QUESTION_CARD_WAIT_SECONDS" -ge 1 ] \
+    && [ "$QUESTION_CARD_WAIT_SECONDS" -le 86400 ]; then
+    if [ "$QUESTION_CARD_WAIT_SECONDS" -eq 86400 ]; then
+      check "Question cards wait until the 86400-second outer expiry" 0
+    else
+      check "Question cards wait $QUESTION_CARD_WAIT_SECONDS seconds before text fallback; outer expiry is 86400 seconds" 0
+    fi
+  else
+    check "CTI_QUESTION_CARD_WAIT_SECONDS is an integer from 1 to 86400" 1
+  fi
+fi
+
 # --- Claude permission posture (claude/auto modes only) ---
 if [ "$CTI_RUNTIME" = "claude" ] || [ "$CTI_RUNTIME" = "auto" ]; then
   CLAUDE_BINDING_MODE=$(get_config CTI_FIXED_MODE)

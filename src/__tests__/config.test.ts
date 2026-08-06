@@ -194,6 +194,12 @@ describe('configToSettings', () => {
     assert.equal(m.has('bridge_session_policy'), false);
   });
 
+  it('maps a configurable question-card wait without changing the 24-hour default when unset', () => {
+    const configured = configToSettings({ ...base, questionCardWaitSeconds: 1800 });
+    assert.equal(configured.get('bridge_question_card_wait_seconds'), '1800');
+    assert.equal(configToSettings(base).has('bridge_question_card_wait_seconds'), false);
+  });
+
   it('omits optional fields when not set', () => {
     const m = configToSettings(base);
     assert.equal(m.has('telegram_bot_token'), false);
@@ -284,6 +290,7 @@ describe('Codex execution policy validation', () => {
       codexSandboxMode: 'workspace-write',
       codexApprovalPolicy: 'never',
       codexNetworkAccess: true,
+      questionCardWaitSeconds: 3600,
       sessionPolicy: 'fixed-confirm-recovery',
       configHash: 'config-hash-canary',
     };
@@ -350,6 +357,7 @@ describe('loadConfig/saveConfig round-trip', () => {
       feishuGroupPolicy: 'allowlist',
       feishuGroupAllowFrom: ['group_canary'],
       feishuRequireMention: true,
+      questionCardWaitSeconds: 1,
       sessionPolicy: 'fixed-confirm-recovery',
       codexSandboxMode: 'workspace-write',
       codexApprovalPolicy: 'never',
@@ -366,6 +374,8 @@ describe('loadConfig/saveConfig round-trip', () => {
     assert.equal(loaded.codexSandboxMode, config.codexSandboxMode);
     assert.equal(loaded.codexApprovalPolicy, config.codexApprovalPolicy);
     assert.equal(loaded.codexNetworkAccess, config.codexNetworkAccess);
+    assert.equal(loaded.questionCardWaitSeconds, config.questionCardWaitSeconds);
+    assert.equal(configToSettings(loaded).get('bridge_question_card_wait_seconds'), '1');
     assert.match(loaded.configHash || '', /^[a-f0-9]{64}$/);
     assert.equal(fs.statSync(CONFIG_PATH).mode & 0o777, 0o600);
   });
@@ -378,6 +388,9 @@ describe('loadConfig/saveConfig round-trip', () => {
     ['CTI_CODEX_SANDBOX_MODE', 'unsafe-ish'],
     ['CTI_CODEX_APPROVAL_POLICY', 'always'],
     ['CTI_CODEX_NETWORK_ACCESS', 'yes'],
+    ['CTI_QUESTION_CARD_WAIT_SECONDS', '0'],
+    ['CTI_QUESTION_CARD_WAIT_SECONDS', '86401'],
+    ['CTI_QUESTION_CARD_WAIT_SECONDS', '1.5'],
   ]) {
     it(`rejects invalid ${key} before startup`, () => {
       fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
