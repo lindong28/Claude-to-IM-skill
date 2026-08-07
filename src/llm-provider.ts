@@ -47,6 +47,12 @@ const CLI_AUTH_PATTERNS = [
   /loggedIn['":\s]*false/i,
 ];
 
+/** Patterns indicating that the authenticated account's organization disabled Claude Code. */
+const ENTITLEMENT_PATTERNS = [
+  /organization.*disabled.*Claude subscription access/i,
+  /organization.*disabled.*Claude Code/i,
+];
+
 /**
  * Patterns indicating an API-level credential failure (wrong key, expired token, org restriction).
  * Must be specific to API/auth context — avoid matching local file permissions, tool denials,
@@ -60,7 +66,7 @@ const API_AUTH_PATTERNS = [
   /401\b/,
 ];
 
-export type AuthErrorKind = 'cli' | 'api' | false;
+export type AuthErrorKind = 'cli' | 'api' | 'entitlement' | false;
 
 /**
  * Classify an error message as a CLI login issue, an API credential issue, or neither.
@@ -68,6 +74,7 @@ export type AuthErrorKind = 'cli' | 'api' | false;
  */
 export function classifyAuthError(text: string): AuthErrorKind {
   if (CLI_AUTH_PATTERNS.some(re => re.test(text))) return 'cli';
+  if (ENTITLEMENT_PATTERNS.some(re => re.test(text))) return 'entitlement';
   if (API_AUTH_PATTERNS.some(re => re.test(text))) return 'api';
   return false;
 }
@@ -83,6 +90,57 @@ const CLI_AUTH_USER_MESSAGE =
 const API_AUTH_USER_MESSAGE =
   'API credential error. Check your ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN in config.env, ' +
   'or verify your organization has access to the requested model.';
+
+const ENTITLEMENT_USER_MESSAGE =
+  'Claude could not run this task because the account\'s organization has disabled Claude Code ' +
+  'subscription access. Ask an organization administrator to re-enable Claude Code for this account, ' +
+  'or ask the bridge operator to switch this instance to an Anthropic API key.';
+
+const GENERIC_PROVIDER_USER_MESSAGE =
+  'Claude could not complete this task because the provider returned no diagnostic. ' +
+  'Ask the bridge operator to inspect the provider log and run the bridge doctor, then retry.';
+
+function authUserMessage(kind: Exclude<AuthErrorKind, false>): string {
+  if (kind === 'cli') return CLI_AUTH_USER_MESSAGE;
+  if (kind === 'entitlement') return ENTITLEMENT_USER_MESSAGE;
+  return API_AUTH_USER_MESSAGE;
+}
+
+function isEmptyErrorText(text: string): boolean {
+  return text.trim() === '' || /^error\s*:?\s*$/i.test(text);
+}
+
+function userFacingProviderError(
+  message: string,
+  stderr = '',
+  assistantText = '',
+): string {
+  const authKind = classifyAuthError(assistantText)
+    || classifyAuthError(message)
+    || classifyAuthError(stderr);
+  if (authKind) return authUserMessage(authKind);
+
+  const cleanMessage = isEmptyErrorText(message) ? '' : message.trim();
+  if (cleanMessage.includes('process exited with code')) {
+    const stderrSummary = stderr.trim();
+    const lines = [cleanMessage];
+    if (stderrSummary) {
+      lines.push('', 'CLI stderr:', stderrSummary.slice(-1024));
+    }
+    lines.push(
+      '',
+      'Possible causes:',
+      '• Claude CLI not authenticated — run: claude auth login',
+      '• Claude CLI version too old (need >= 2.x) — run: claude --version',
+      '• Missing ANTHROPIC_* env vars in daemon — check config.env',
+      '',
+      'Ask the bridge operator to run the bridge doctor and inspect the provider log.',
+    );
+    return lines.join('\n');
+  }
+
+  return cleanMessage || GENERIC_PROVIDER_USER_MESSAGE;
+}
 
 // ── Cross-runtime model guard ──
 
@@ -406,9 +464,9 @@ function buildPrompt(
  *
  * Key distinction:
  *   hasReceivedResult — set when the SDK delivers a `result` message
- *     (success OR structured error). This means the CLI completed its
- *     business logic; any subsequent "process exited with code 1" is
- *     just the transport tearing down and should be suppressed.
+ *     (success OR structured error). A result alone does not prove that
+ *     the user received an answer: error results and empty error arrays
+ *     must remain visible failures rather than teardown noise.
  *
  *   hasStreamedText — set when at least one text_delta was emitted.
  *     Used to distinguish "partial output + crash" (real failure, must
@@ -418,6 +476,12 @@ function buildPrompt(
 export interface StreamState {
   /** True once a `result` message (success or error subtype) has been processed. */
   hasReceivedResult: boolean;
+  /** True only when the processed result represented successful task completion. */
+  hasReceivedSuccessfulResult?: boolean;
+  /** True after a non-empty error outcome has been emitted to the bridge. */
+  hasEmittedUserVisibleError?: boolean;
+  /** Recent CLI stderr retained for classification, never forwarded verbatim by default. */
+  lastProviderStderr?: string;
   /** True after a top-level terminal signal (`message_stop` or `end_turn`) until activity resumes. */
   hasReachedEndTurn: boolean;
   /** True once any text_delta has been emitted via stream_event. */
@@ -439,7 +503,12 @@ export class SDKLLMProvider implements LLMProvider {
   private cliPath: string | undefined;
   private autoApprove: boolean;
 
-  constructor(private pendingPerms: PendingPermissions, cliPath?: string, autoApprove = false) {
+  constructor(
+    private pendingPerms: PendingPermissions,
+    cliPath?: string,
+    autoApprove = false,
+    private queryFn: typeof query = query,
+  ) {
     this.cliPath = cliPath;
     this.autoApprove = autoApprove;
   }
@@ -448,6 +517,7 @@ export class SDKLLMProvider implements LLMProvider {
     const pendingPerms = this.pendingPerms;
     const cliPath = this.cliPath;
     const autoApprove = this.autoApprove;
+    const queryFn = this.queryFn;
 
     return new ReadableStream({
       start(controller) {
@@ -457,6 +527,8 @@ export class SDKLLMProvider implements LLMProvider {
           let stderrBuf = '';
           const state: StreamState = {
             hasReceivedResult: false,
+            hasReceivedSuccessfulResult: false,
+            hasEmittedUserVisibleError: false,
             hasReachedEndTurn: false,
             hasStreamedText: false,
             lastAssistantHadToolUse: false,
@@ -501,6 +573,7 @@ export class SDKLLMProvider implements LLMProvider {
                 if (stderrBuf.length > MAX_STDERR) {
                   stderrBuf = stderrBuf.slice(-MAX_STDERR);
                 }
+                state.lastProviderStderr = stderrBuf;
               },
               canUseTool: async (
                   toolName: string,
@@ -560,7 +633,7 @@ export class SDKLLMProvider implements LLMProvider {
             }
 
             const prompt = buildPrompt(params.prompt, params.files);
-            const q = query({
+            const q = queryFn({
               prompt: prompt as Parameters<typeof query>[0]['prompt'],
               options: queryOptions as Parameters<typeof query>[0]['options'],
             });
@@ -577,14 +650,14 @@ export class SDKLLMProvider implements LLMProvider {
 
             const isTransportExit = message.includes('process exited with code');
 
-            // ── Case 1: Result already received ──
-            // The SDK delivered a proper result (success or structured error).
-            // A trailing "process exited with code 1" is transport teardown noise.
+            // ── Case 1: A successful answer already completed ──
+            // A trailing "process exited with code 1" is teardown noise only when
+            // the bridge already emitted answer text or can emit the final answer now.
             if (shouldSuppressCompletedTransportExit(state, message)) {
-              if (!state.hasReceivedResult) {
+              if (!state.hasStreamedText) {
                 console.warn(
-                  '[llm-provider] SDK transport exited after a top-level terminal signal without a result; ' +
-                  'completing from the final assistant response',
+                  '[llm-provider] SDK transport exited before the final assistant response was streamed; ' +
+                  'completing from the captured final response',
                 );
                 emitEndTurnFallback(controller, state);
               }
@@ -593,53 +666,24 @@ export class SDKLLMProvider implements LLMProvider {
               return;
             }
 
-            // ── Case 2: Recognised business error in assistant text ──
-            // The CLI returned an assistant message with text that matches
-            // a known auth/access error pattern (e.g. "Your organization
-            // does not have access to Claude"). Forward it as-is — it's
-            // more informative than the generic transport error.
-            // Only activate when the text is a recognised error; otherwise
-            // a normal response that crashed before result would be silently
-            // presented as if it succeeded.
-            if (state.lastAssistantText && classifyAuthError(state.lastAssistantText)) {
-              controller.enqueue(sseEvent('text', state.lastAssistantText));
+            // A structured SDK error may be followed by the same transport exit.
+            // The user-visible error was already emitted; do not duplicate it.
+            if (isTransportExit && state.hasEmittedUserVisibleError) {
+              console.log('[llm-provider] Ignoring transport exit after a user-visible SDK error');
               controller.close();
               return;
             }
 
-            // ── Case 3: Partial output + crash ──
+            // ── Case 2: Partial output + crash ──
             // Text was streamed but no result arrived — the response was
             // truncated by a real crash. Always emit an error so the user
             // knows the output is incomplete.
 
             // ── Build user-facing error message ──
-            const authKind = classifyAuthError(message) || classifyAuthError(stderrBuf);
-            let userMessage: string;
-            if (authKind === 'cli') {
-              userMessage = CLI_AUTH_USER_MESSAGE;
-            } else if (authKind === 'api') {
-              userMessage = API_AUTH_USER_MESSAGE;
-            } else if (isTransportExit) {
-              const stderrSummary = stderrBuf.trim();
-              const lines = [message];
-              if (stderrSummary) {
-                lines.push('', 'CLI stderr:', stderrSummary.slice(-1024));
-              }
-              lines.push(
-                '',
-                'Possible causes:',
-                '• Claude CLI not authenticated — run: claude auth login',
-                '• Claude CLI version too old (need >= 2.x) — run: claude --version',
-                '• Missing ANTHROPIC_* env vars in daemon — check config.env',
-                '',
-                'Run `/claude-to-im doctor` to diagnose.',
-              );
-              userMessage = lines.join('\n');
-            } else {
-              userMessage = message;
-            }
+            const userMessage = userFacingProviderError(message, stderrBuf, state.lastAssistantText);
 
             controller.enqueue(sseEvent('error', userMessage));
+            state.hasEmittedUserVisibleError = true;
             controller.close();
           } finally {
             params.abortController?.signal.removeEventListener('abort', forwardAbort);
@@ -651,8 +695,11 @@ export class SDKLLMProvider implements LLMProvider {
 }
 
 export function shouldSuppressCompletedTransportExit(state: StreamState, message: string): boolean {
+  const hasCompletableAnswer = state.hasStreamedText
+    || (state.lastAssistantHadCompletableText === true && state.lastAssistantText.trim().length > 0);
   return message.includes('process exited with code')
-    && (state.hasReceivedResult || (state.hasReachedEndTurn && state.lastAssistantHadCompletableText === true));
+    && hasCompletableAnswer
+    && (state.hasReceivedSuccessfulResult === true || state.hasReachedEndTurn);
 }
 
 function emitEndTurnFallback(
@@ -882,6 +929,7 @@ export function handleMessage(
     case 'result': {
       state.hasReceivedResult = true;
       if (msg.subtype === 'success') {
+        state.hasReceivedSuccessfulResult = msg.is_error !== true;
         controller.enqueue(
           sseEvent('result', {
             session_id: msg.session_id,
@@ -896,12 +944,26 @@ export function handleMessage(
           }),
         );
       } else {
+        state.hasReceivedSuccessfulResult = false;
+        // A failed result invalidates any earlier terminal candidate. It must
+        // never be emitted later as a completed answer during transport teardown.
+        state.hasReachedEndTurn = false;
+        state.lastAssistantHadCompletableText = false;
         // Error result from SDK (distinct from transport errors in catch)
-        const errors =
+        const rawErrors =
           'errors' in msg && Array.isArray(msg.errors)
-            ? msg.errors.join('; ')
-            : 'Unknown error';
-        controller.enqueue(sseEvent('error', errors));
+            ? msg.errors
+              .map((entry) => String(entry).trim())
+              .filter(Boolean)
+              .join('; ')
+            : '';
+        const userMessage = userFacingProviderError(
+          rawErrors,
+          state.lastProviderStderr,
+          state.lastAssistantText,
+        );
+        controller.enqueue(sseEvent('error', userMessage));
+        state.hasEmittedUserVisibleError = true;
       }
       break;
     }

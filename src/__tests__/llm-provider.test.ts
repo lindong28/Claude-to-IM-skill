@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   isAuthError,
   classifyAuthError,
+  SDKLLMProvider,
   isNonClaudeModel,
   parseCliMajorVersion,
   handleMessage,
@@ -27,6 +28,20 @@ function makeFakeController() {
     desiredSize: 1,
   } as unknown as ReadableStreamDefaultController<string>;
   return { controller, chunks };
+}
+
+async function collectStream(stream: ReadableStream<string>): Promise<string[]> {
+  const chunks: string[] = [];
+  const reader = stream.getReader();
+  while (true) {
+    const next = await reader.read();
+    if (next.done) return chunks;
+    chunks.push(next.value);
+  }
+}
+
+function parseSSEChunks(chunks: string[]): Array<{ type: string; data: unknown }> {
+  return chunks.map((chunk) => JSON.parse(chunk.slice('data: '.length)));
 }
 
 function freshState(): StreamState {
@@ -98,6 +113,16 @@ describe('classifyAuthError', () => {
     assert.equal(classifyAuthError('authentication has failed'), 'api');
     assert.equal(classifyAuthError('HTTP 401 Unauthorized'), 'api');
     assert.equal(classifyAuthError('does not have access to Claude'), 'api');
+  });
+
+  it('returns "entitlement" when an organization disables Claude Code access', () => {
+    assert.equal(
+      classifyAuthError(
+        'Your organization has disabled Claude subscription access for Claude Code · ' +
+        'Use an Anthropic API key instead, or ask your admin to enable access',
+      ),
+      'entitlement',
+    );
   });
 
   it('returns false for non-auth errors', () => {
@@ -305,6 +330,37 @@ describe('handleMessage state tracking', () => {
     } as any, controller, state);
 
     assert.equal(state.hasReceivedResult, true);
+  });
+
+  it('never emits an empty error when an error result has no errors array content', () => {
+    const { controller, chunks } = makeFakeController();
+    const state = freshState();
+
+    handleMessage({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: {
+        stop_reason: 'stop_sequence',
+        content: [{
+          type: 'text',
+          text: 'Your organization has disabled Claude subscription access for Claude Code',
+        }],
+      },
+    } as any, controller, state);
+    handleMessage({
+      type: 'result',
+      subtype: 'error_during_execution',
+      is_error: true,
+      errors: [],
+    } as any, controller, state);
+
+    const errorEvents = chunks.map((chunk) => JSON.parse(chunk.slice('data: '.length)))
+      .filter((event) => event.type === 'error');
+    assert.equal(errorEvents.length, 1);
+    assert.equal(typeof errorEvents[0].data, 'string');
+    assert.ok(errorEvents[0].data.trim().length > 0, 'error body must not be empty');
+    assert.match(errorEvents[0].data, /organization.*disabled Claude Code/i);
+    assert.match(errorEvents[0].data, /re-enable|API key/i);
   });
 
   it('emits tool_use from assistant block', () => {
@@ -790,22 +846,26 @@ describe('catch block error suppression logic', () => {
   // the state conditions that drive its behavior.
 
   it('result received + exit code → should suppress (transport noise)', () => {
-    const state: StreamState = { hasReceivedResult: true, hasReachedEndTurn: false, hasStreamedText: true, lastAssistantText: '' };
+    const state: StreamState = {
+      hasReceivedResult: true,
+      hasReceivedSuccessfulResult: true,
+      hasReachedEndTurn: false,
+      hasStreamedText: true,
+      lastAssistantText: '',
+    };
     const errorMsg = 'Claude Code process exited with code 1';
-    const isTransportExit = errorMsg.includes('process exited with code');
 
-    // This is the condition in the catch block:
-    const shouldSuppress = state.hasReceivedResult && isTransportExit;
-    assert.equal(shouldSuppress, true);
+    assert.equal(shouldSuppressCompletedTransportExit(state, errorMsg), true);
   });
 
   it('partial text + exit code (no result) → should NOT suppress (real crash)', () => {
     const state: StreamState = { hasReceivedResult: false, hasReachedEndTurn: false, hasStreamedText: true, lastAssistantText: '' };
     const errorMsg = 'Claude Code process exited with code 1';
-    const isTransportExit = errorMsg.includes('process exited with code');
-
-    const shouldSuppress = state.hasReceivedResult && isTransportExit;
-    assert.equal(shouldSuppress, false, 'partial output crash must NOT be suppressed');
+    assert.equal(
+      shouldSuppressCompletedTransportExit(state, errorMsg),
+      false,
+      'partial output crash must NOT be suppressed',
+    );
   });
 
   it('assistant text with recognised auth error → should surface as business error', () => {
@@ -847,11 +907,18 @@ describe('catch block error suppression logic', () => {
   it('streaming + result + exit code → should suppress', () => {
     // Normal successful flow that ends with exit code 0 won't throw,
     // but some edge cases might. Verify suppression.
-    const state: StreamState = { hasReceivedResult: true, hasReachedEndTurn: false, hasStreamedText: true, lastAssistantText: 'some response' };
-    const isTransportExit = true;
+    const state: StreamState = {
+      hasReceivedResult: true,
+      hasReceivedSuccessfulResult: true,
+      hasReachedEndTurn: false,
+      hasStreamedText: true,
+      lastAssistantText: 'some response',
+    };
 
-    const shouldSuppress = state.hasReceivedResult && isTransportExit;
-    assert.equal(shouldSuppress, true);
+    assert.equal(
+      shouldSuppressCompletedTransportExit(state, 'Claude Code process exited with code 1'),
+      true,
+    );
   });
 
   it('top-level end_turn + transport exit → should complete from the terminal response', () => {
@@ -880,5 +947,193 @@ describe('catch block error suppression logic', () => {
       shouldSuppressCompletedTransportExit(state, 'Claude Code process exited with code 1'),
       false,
     );
+  });
+
+  it('error result without delivered answer + transport exit → should not suppress', () => {
+    const { controller } = makeFakeController();
+    const state = freshState();
+    handleMessage({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: {
+        stop_reason: 'stop_sequence',
+        content: [{
+          type: 'text',
+          text: 'Your organization has disabled Claude subscription access for Claude Code',
+        }],
+      },
+    } as any, controller, state);
+    handleMessage({
+      type: 'result',
+      subtype: 'error_during_execution',
+      is_error: true,
+      errors: [],
+    } as any, controller, state);
+
+    assert.equal(state.hasReceivedResult, true, 'the SDK error result sets the first old disjunct');
+    assert.equal(state.hasReachedEndTurn, false, 'stop_sequence cannot set the end_turn disjunct');
+    assert.equal(state.hasStreamedText, false, 'no answer was delivered');
+    assert.equal(
+      shouldSuppressCompletedTransportExit(state, 'Claude Code process exited with code 1'),
+      false,
+      'a failed result without an answer is not completed transport noise',
+    );
+  });
+
+  it('error result invalidates an earlier end_turn candidate before transport exit', () => {
+    const { controller } = makeFakeController();
+    const state = freshState();
+    handleMessage({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: {
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'candidate answer' }],
+      },
+    } as any, controller, state);
+    handleMessage({
+      type: 'result',
+      subtype: 'error_during_execution',
+      is_error: true,
+      errors: ['late terminal error'],
+    } as any, controller, state);
+
+    assert.equal(state.hasReachedEndTurn, false);
+    assert.equal(state.lastAssistantHadCompletableText, false);
+    assert.equal(
+      shouldSuppressCompletedTransportExit(state, 'Claude Code process exited with code 1'),
+      false,
+    );
+  });
+});
+
+describe('SDKLLMProvider user-visible failures', () => {
+  const pendingPerms = {
+    waitFor: async () => ({ behavior: 'deny' }),
+    waitForQuestion: async () => ({ behavior: 'deny' }),
+  } as any;
+
+  const params = {
+    prompt: 'What time is it?',
+    workingDirectory: process.cwd(),
+    permissionMode: 'acceptEdits',
+  } as any;
+
+  it('surfaces an actionable entitlement error for the incident SDK sequence', async () => {
+    const queryFn = () => (async function* () {
+      yield {
+        type: 'assistant',
+        parent_tool_use_id: null,
+        message: {
+          stop_reason: 'stop_sequence',
+          content: [{
+            type: 'text',
+            text: 'Your organization has disabled Claude subscription access for Claude Code · ' +
+              'Use an Anthropic API key instead, or ask your admin to enable access',
+          }],
+        },
+      } as any;
+      yield {
+        type: 'result',
+        subtype: 'error_during_execution',
+        is_error: true,
+        errors: [],
+      } as any;
+      throw new Error('Claude Code process exited with code 1');
+    })() as any;
+    const provider = new SDKLLMProvider(pendingPerms, undefined, false, queryFn as any);
+
+    const events = parseSSEChunks(await collectStream(provider.streamChat(params)));
+    const errors = events.filter((event) => event.type === 'error')
+      .map((event) => String(event.data));
+
+    assert.equal(errors.length, 1, 'the failed turn should have one clear terminal error');
+    assert.ok(errors[0].trim().length > 0, 'the terminal error body must not be empty');
+    assert.match(errors[0], /organization.*disabled Claude Code/i);
+    assert.match(errors[0], /re-enable|API key/i);
+  });
+
+  it('uses an actionable generic fallback when the provider throws an empty error', async () => {
+    const queryFn = () => (async function* () {
+      throw new Error('');
+    })() as any;
+    const provider = new SDKLLMProvider(pendingPerms, undefined, false, queryFn as any);
+
+    const events = parseSSEChunks(await collectStream(provider.streamChat(params)));
+    const errors = events.filter((event) => event.type === 'error')
+      .map((event) => String(event.data));
+
+    assert.equal(errors.length, 1);
+    assert.ok(errors[0].trim().length > 0, 'the terminal error body must not be empty');
+    assert.match(errors[0], /could not complete this task/i);
+    assert.match(errors[0], /operator|doctor|log/i);
+  });
+
+  it('does not emit a cached answer after an error result invalidates end_turn', async () => {
+    const queryFn = () => (async function* () {
+      yield {
+        type: 'assistant',
+        parent_tool_use_id: null,
+        message: {
+          stop_reason: 'end_turn',
+          content: [{ type: 'text', text: 'candidate answer' }],
+        },
+      } as any;
+      yield {
+        type: 'result',
+        subtype: 'error_during_execution',
+        is_error: true,
+        errors: ['late terminal error'],
+      } as any;
+      throw new Error('Claude Code process exited with code 1');
+    })() as any;
+    const provider = new SDKLLMProvider(pendingPerms, undefined, false, queryFn as any);
+
+    const events = parseSSEChunks(await collectStream(provider.streamChat(params)));
+    assert.deepEqual(events.filter((event) => event.type === 'text'), []);
+    assert.deepEqual(
+      events.filter((event) => event.type === 'error').map((event) => event.data),
+      ['late terminal error'],
+    );
+  });
+
+  it('treats an all-whitespace structured error array as missing diagnostics', async () => {
+    const queryFn = () => (async function* () {
+      yield {
+        type: 'result',
+        subtype: 'error_during_execution',
+        is_error: true,
+        errors: ['', '   '],
+      } as any;
+    })() as any;
+    const provider = new SDKLLMProvider(pendingPerms, undefined, false, queryFn as any);
+
+    const events = parseSSEChunks(await collectStream(provider.streamChat(params)));
+    const errors = events.filter((event) => event.type === 'error').map((event) => String(event.data));
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /provider returned no diagnostic/i);
+  });
+
+  it('uses a stderr-only entitlement diagnostic when structured errors are empty', async () => {
+    const queryFn = ({ options }: any) => (async function* () {
+      options.stderr(
+        'Your organization has disabled Claude subscription access for Claude Code · ' +
+        'Use an Anthropic API key instead, or ask your admin to enable access',
+      );
+      yield {
+        type: 'result',
+        subtype: 'error_during_execution',
+        is_error: true,
+        errors: [],
+      } as any;
+      throw new Error('Claude Code process exited with code 1');
+    })() as any;
+    const provider = new SDKLLMProvider(pendingPerms, undefined, false, queryFn as any);
+
+    const events = parseSSEChunks(await collectStream(provider.streamChat(params)));
+    const errors = events.filter((event) => event.type === 'error').map((event) => String(event.data));
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /organization.*disabled Claude Code/i);
+    assert.match(errors[0], /re-enable|API key/i);
   });
 });
