@@ -58,31 +58,28 @@ Extract optional numeric argument for `logs` (default 50).
 
 Before asking users for any platform credentials, read `SKILL_DIR/references/setup-guides.md` internally so you know where to find each credential. Do NOT dump the full guide to the user upfront — only mention the specific next step they need to do (e.g., "Go to https://open.feishu.cn → your app → Credentials to find the App ID"). If the user says they don't know how, then show the relevant section of the guide.
 
-## Runtime detection
+## AskUserQuestion capability detection
 
-Before executing any subcommand, detect which environment you are running in:
+Before executing any subcommand, select one of two presentation modes through this ordered check:
 
-1. **Claude Code** — `AskUserQuestion` tool is available. Use it for interactive setup wizards.
-2. **Codex / other** — `AskUserQuestion` is NOT available. Fall back to non-interactive guidance: explain the steps, show `SKILL_DIR/config.env.example`, and ask the user to create the config in the resolved instance home manually.
-
-You can test this by checking if AskUserQuestion is in your available tools list.
+1. If `AskUserQuestion` is directly callable and renders an elicitation form, use **interactive form**.
+2. Otherwise, in Codex use the current surface's deferred discovery mechanism to find the exact canonical name `mcp__ask_user__AskUserQuestion`. If the discovered tool renders an elicitation form, use **interactive form**.
+3. If discovery is unavailable, the exact lookup is empty, the call fails, or the tool returns a fallback instruction, use **chat fallback**: present numbered options in the response, stop for the user's answer, and do not choose for the user.
 
 ## Config check (applies to `start`, `status`, `logs`, `reconfigure`, `doctor`)
 
 Check the resolved instance home, not hardcoded default paths. The default config is `~/.claude-to-im/config.env`; named config is `~/.claude-to-im-<instance>/config.env`.
 
 - **If it does NOT exist:**
-  - In Claude Code: tell the user "No configuration found" and automatically start the `setup` wizard using AskUserQuestion.
-  - In Codex: tell the user which resolved config path is missing, show `SKILL_DIR/config.env.example`, and stop. Do not attempt start without config.
+  - With an interactive form: tell the user "No configuration found" and automatically start the `setup` wizard.
+  - With chat fallback: tell the user which resolved config path is missing and start the same `setup` wizard one question at a time in chat. Do not attempt `start` before setup completes.
 - **If it exists:** proceed with the requested subcommand.
 
 ## Subcommands
 
 ### `setup`
 
-Run an interactive setup wizard. This subcommand requires `AskUserQuestion`. If it is not available (Codex environment), instead show the contents of `SKILL_DIR/config.env.example` with field-by-field explanations and instruct the user to create the config file manually.
-
-When AskUserQuestion IS available, collect input **one field at a time**. After each answer, confirm the value back to the user (masking secrets to last 4 chars only) before moving to the next question.
+Run the setup wizard with the presentation mode selected above. Collect input **one field at a time**. With chat fallback, render choice questions as numbered options and stop after each question; ask free-form fields directly. After each answer, confirm the value back to the user (masking secrets to last 4 chars only) before moving to the next question.
 
 **Step 1 — Choose channels**
 
@@ -177,7 +174,7 @@ Run: `CTI_INSTANCE="$INSTANCE" bash "$SKILL_DIR/scripts/daemon.sh" logs N`.
 
 1. Read current config from the resolved instance home
 2. Show current settings in a clear table format, with all secrets masked (only last 4 chars visible)
-3. Use AskUserQuestion to ask what the user wants to change
+3. Ask what the user wants to change using the presentation mode selected above
 4. When collecting new values, tell the user where to find the value; only show the full guide from `SKILL_DIR/references/setup-guides.md` if they ask for help
 5. Update the config file atomically (write to tmp, rename)
 6. Re-validate any changed tokens
