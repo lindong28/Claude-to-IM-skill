@@ -4,8 +4,9 @@ description: |
   Bridge THIS Claude Code or Codex session to Telegram, Discord, Feishu/Lark, QQ, or WeChat so the
   user can chat with Claude from their phone. Use for: setting up, starting, stopping,
   or diagnosing the claude-to-im bridge daemon; forwarding Claude replies to a messaging
-  app; any phrase like "claude-to-im", "bridge", "消息推送", "消息转发", "桥接",
-  "连上飞书", "手机上看claude", "启动后台服务", "诊断", "查看日志", "配置".
+  app through this bridge, including requests like "连上飞书" or "手机上看claude".
+  Generic configuration, logs, diagnosis, or background-service requests only match
+  when they refer to this bridge.
   Subcommands: setup, start, stop, status, logs, reconfigure, doctor, uninstall, remove.
   Do NOT use for: building standalone bots, webhook integrations, or coding with IM
   platform SDKs — those are regular programming tasks.
@@ -27,14 +28,15 @@ The skill directory (SKILL_DIR) is at `~/.claude/skills/claude-to-im`.
 In Codex installs it may instead be `~/.codex/skills/Claude-to-IM-skill`.
 If neither path exists, fall back to Glob with pattern `**/skills/**/claude-to-im/SKILL.md` or `**/skills/**/Claude-to-IM-skill/SKILL.md` and derive the root from the result.
 
-Resolve one instance identity before reading or writing config and bind it as `INSTANCE`. Use `default` unless the user names an instance; this plan uses `INSTANCE=quant-lab`. A named instance maps to home `~/.claude-to-im-$INSTANCE`, launchd label `com.claude-to-im.bridge.$INSTANCE`, and an independent config/store/log/runtime tree. Keep that variable unchanged for every setup, lifecycle, and doctor command:
+Resolve one instance identity before accessing its config or state and bind it as `INSTANCE`. Use `default` unless the user names an instance. Resolve its home through `scripts/instance-env.sh`, preserving an explicit `CTI_HOME` only when it belongs to the selected instance. The resolver derives the default or named home and checks ownership and unsafe aliases. Bind its result as `INSTANCE_HOME`; stop if resolution fails. Keep both values for setup, lifecycle, diagnosis, and login:
 
 ```bash
-CTI_INSTANCE="$INSTANCE" bash "$SKILL_DIR/scripts/daemon.sh" <start|stop|status|logs|uninstall|remove>
-CTI_INSTANCE="$INSTANCE" bash "$SKILL_DIR/scripts/doctor.sh"
+INSTANCE_HOME="$(CTI_INSTANCE="$INSTANCE" bash -c 'source "$1" || exit $?; printf "%s\n" "$CTI_HOME"' _ "$SKILL_DIR/scripts/instance-env.sh")" || exit
+CTI_INSTANCE="$INSTANCE" CTI_HOME="$INSTANCE_HOME" bash "$SKILL_DIR/scripts/daemon.sh" <start|stop|status|logs|uninstall|remove>
+CTI_INSTANCE="$INSTANCE" CTI_HOME="$INSTANCE_HOME" bash "$SKILL_DIR/scripts/doctor.sh"
 ```
 
-Never omit `CTI_INSTANCE` midway through a named workflow: omission targets the protected default instance.
+Do not omit either identity value midway through a workflow. Direct Node helpers need `CTI_HOME`; `CTI_INSTANCE` alone does not select their store.
 
 ## Command parsing
 
@@ -60,30 +62,30 @@ Before asking users for any platform credentials, read `SKILL_DIR/references/set
 
 ## AskUserQuestion capability detection
 
-Before executing any subcommand, select one of two presentation modes through this ordered check:
+Only when missing input or a user-owned choice requires a question, select a presentation mode through this ordered check. Reuse an already resolved, still available capability:
 
 1. If `AskUserQuestion` is directly callable and renders an elicitation form, use **interactive form**.
 2. Otherwise, in Codex use the current surface's deferred discovery mechanism to find the exact canonical name `mcp__ask_user__AskUserQuestion`. If the discovered tool renders an elicitation form, use **interactive form**.
 3. If discovery is unavailable, the exact lookup is empty, the call fails, or the tool returns a fallback instruction, use **chat fallback**: present numbered options in the response, stop for the user's answer, and do not choose for the user.
 
-## Config check (applies to `start`, `status`, `logs`, `reconfigure`, `doctor`)
+## Configuration source and missing config
 
-Check the resolved instance home, not hardcoded default paths. The default config is `~/.claude-to-im/config.env`; named config is `~/.claude-to-im-<instance>/config.env`.
+Check `$INSTANCE_HOME/config.env` without exposing its values. Before setup or reconfiguration, identify who owns that configuration:
 
-- **If it does NOT exist:**
-  - With an interactive form: tell the user "No configuration found" and automatically start the `setup` wizard.
-  - With chat fallback: tell the user which resolved config path is missing and start the same `setup` wizard one question at a time in chat. Do not attempt `start` before setup completes.
-- **If it exists:** proceed with the requested subcommand.
+- **Repository-managed deployment:** follow the owning repository's rules, edit its tracked source, and apply it through its installer. `scripts/install-from-repo.sh` consumes `skill-configs/claude-to-im/instances/<instance>/config.env` in its owning harness repository. It can materialize or restart multiple instances; check its actual effects against the request before running it. Do not hand-edit a generated runtime copy or treat a single-instance request as permission to change other instances.
+- **Standalone installation:** write the resolved home config. Preserve private directory mode `0700` and config mode `0600`.
+
+For `status`, `logs`, and `doctor`, complete the requested check and report missing configuration; do not turn a query into setup. `doctor` also checks configured tokens against platform APIs. For `start` or `reconfigure` without config, report the missing path and continue setup only if configuration is already authorized; otherwise ask whether to set it up. Never start an unconfigured instance.
 
 ## Subcommands
 
 ### `setup`
 
-Run the setup wizard with the presentation mode selected above. Collect input **one field at a time**. With chat fallback, render choice questions as numbered options and stop after each question; ask free-form fields directly. After each answer, confirm the value back to the user (masking secrets to last 4 chars only) before moving to the next question.
+Reuse values the user already supplied. Ask only for missing or ambiguous inputs, grouping independent fields within the question tool's limits; wait for dependent answers before asking their follow-ups. Do not repeat each value for a separate confirmation. Keep the final confirmation before writing configuration. With chat fallback, group the current missing inputs, number actual choices, and wait for the user's answer rather than choosing for them. Follow the deployment's approved credential-entry mechanism; never echo raw credentials or opaque account IDs into chat or logs.
 
 **Step 1 — Choose channels**
 
-Ask which channels to enable (telegram, discord, feishu, qq, weixin). Accept comma-separated input. Briefly describe each:
+If not already specified, ask which channels to enable (telegram, discord, feishu, qq, weixin). Accept comma-separated input. Describe relevant choices briefly:
 - **telegram** — Best for personal use. Streaming preview, inline permission buttons.
 - **discord** — Good for team use. Server/channel/user-level access control.
 - **feishu** (Lark) — For Feishu/Lark teams. Streaming cards, tool progress, inline permission buttons.
@@ -92,18 +94,18 @@ Ask which channels to enable (telegram, discord, feishu, qq, weixin). Accept com
 
 **Step 2 — Collect tokens per channel**
 
-For each enabled channel, collect one credential at a time. Tell the user where to find each value in one sentence. Only show the full guide section (from `SKILL_DIR/references/setup-guides.md`) if the user asks for help or says they don't know how:
+For the enabled channels, collect missing credentials and access settings. Explain where to find each missing value briefly; show the relevant `SKILL_DIR/references/setup-guides.md` section when help is needed:
 
-- **Telegram**: Bot Token → confirm (masked) → Chat ID (see guide for how to get it) → confirm → Allowed User IDs (optional). **Important:** At least one of Chat ID or Allowed User IDs must be set, otherwise the bot will reject all messages.
-- **Discord**: Bot Token → confirm (masked) → Allowed User IDs → Allowed Channel IDs (optional) → Allowed Guild IDs (optional). **Important:** At least one of Allowed User IDs or Allowed Channel IDs must be set, otherwise the bot will reject all messages (default-deny).
-- **Feishu**: App ID → confirm → App Secret → confirm (masked) → Domain (optional) → Allowed User IDs → Allowed Group IDs → Require Mention. For a named group bot, require non-empty user and group allowlists, `CTI_FEISHU_GROUP_POLICY=allowlist`, and `CTI_FEISHU_REQUIRE_MENTION=true`. Explain how to verify both opaque IDs from an inbound event without pasting them into logs or chat. Then explain the two-phase setup:
+- **Telegram**: Bot Token, Chat ID (see guide), Allowed User IDs (optional). **Important:** At least one of Chat ID or Allowed User IDs must be set, otherwise the bot will reject all messages.
+- **Discord**: Bot Token, Allowed User IDs, Allowed Channel IDs (optional), Allowed Guild IDs (optional). **Important:** At least one of Allowed User IDs or Allowed Channel IDs must be set, otherwise the bot will reject all messages (default-deny).
+- **Feishu**: App ID, App Secret, Domain (optional), Allowed User IDs, Allowed Group IDs, Require Mention. For a named group bot, require non-empty user and group allowlists, `CTI_FEISHU_GROUP_POLICY=allowlist`, and `CTI_FEISHU_REQUIRE_MENTION=true`. Explain how to verify both opaque IDs from an inbound event without pasting them into logs or chat. Then explain the two-phase setup:
   - **Phase 1** (before starting bridge): (A) batch-add permissions, (B) enable bot capability, (C) publish first version + admin approve. This makes permissions and bot effective.
   - **Phase 2** (requires running bridge): (D) start the same instance, (E) configure `im.message.receive_v1` with long connection mode, (F) publish second version + admin approve. Add `card.action.trigger` only when the selected runtime can actually produce interactive approval cards; a Codex instance with `CTI_CODEX_APPROVAL_POLICY=never` does not need it.
   - **Why two phases:** Feishu validates WebSocket connection when saving event subscription — if the bridge isn't running, saving will fail. The bridge needs published permissions to connect.
   - Keep this to a short checklist — show the full guide only if asked.
 - **QQ**: Collect two required fields, then optional ones:
-  1. QQ App ID (required) → confirm
-  2. QQ App Secret (required) → confirm (masked)
+  1. QQ App ID (required)
+  2. QQ App Secret (required)
   - Tell the user: these two values can be found at https://q.qq.com/qqbot/openclaw
   3. Allowed User OpenIDs (optional, press Enter to skip) — note: this is `user_openid`, NOT QQ number. If the user doesn't have openid yet, they can leave it empty.
   4. Image Enabled (optional, default true, press Enter to skip) — if the underlying provider doesn't support image input, set to false
@@ -111,16 +113,16 @@ For each enabled channel, collect one credential at a time. Tell the user where 
   - Remind user: QQ first version only supports C2C private chat sandbox access. No group/channel support, no inline buttons, no streaming preview.
 - **Weixin**: Do not ask for a static token. Instead:
   1. Tell the user this channel uses QR login, not manual credential entry.
-  2. Run `cd SKILL_DIR && npm run weixin:login`
-  3. The helper writes `~/.claude-to-im/runtime/weixin-login.html` and tries to open it automatically in the local browser.
-  4. If auto-open fails, tell the user to open that HTML file manually and scan the QR code with WeChat.
+  2. For the resolved instance, run `(cd "$SKILL_DIR" && CTI_INSTANCE="$INSTANCE" CTI_HOME="$INSTANCE_HOME" npm run weixin:login)`.
+  3. The helper writes `$INSTANCE_HOME/runtime/weixin-login.html` and tries to open it automatically in the local browser; tell the user before launching it. Follow the active harness's frontend-consent and local-delivery rules if browser access needs assistance.
+  4. Have the user scan the QR code with WeChat. Only replace an existing linked account when that change is covered by the user's request or confirmation.
   5. Wait for the helper to report success, then confirm that the linked account was saved locally.
-  - Explain briefly: the linked Weixin account is stored in `~/.claude-to-im/data/weixin-accounts.json`. Running the helper again replaces the previously linked account.
+  - Explain briefly: the linked Weixin account is stored in `$INSTANCE_HOME/data/weixin-accounts.json`. Running the helper again replaces that instance's previously linked account.
   - Explain briefly: `CTI_WEIXIN_MEDIA_ENABLED` only controls inbound image/file/video downloads. For voice messages, the bridge only accepts the text returned by WeChat's built-in speech-to-text. If WeChat does not provide a transcript, the bridge replies with an error instead of downloading/transcribing raw audio.
 
 **Step 3 — General settings**
 
-Ask for runtime, default working directory, model, and mode:
+Collect any missing runtime, default working directory, model, and mode choices:
 - **Runtime**: `claude` (default), `codex`, `auto`
   - `claude` — uses Claude Code CLI + Claude Agent SDK (requires `claude` CLI installed)
   - `codex` — uses OpenAI Codex SDK (requires `codex` CLI; auth via `codex login` or `OPENAI_API_KEY`)
@@ -131,14 +133,13 @@ Ask for runtime, default working directory, model, and mode:
 
 **Step 4 — Write config and validate**
 
-1. Show a final summary table with all settings (secrets masked to last 4 chars)
-2. Ask user to confirm before writing
-3. Create the resolved instance home and `{data,logs,runtime,data/messages}` directories with mode `0700`
-4. Write `config.env` in that home, never in a different instance's home
-5. Set `config.env` mode to `0600`
-6. Validate tokens — read `SKILL_DIR/references/token-validation.md` for the exact commands and expected responses for each platform. This catches typos and wrong credentials before the user tries to start the daemon. For Weixin, a successful QR login already counts as validation.
-7. Report results with a summary table. If any validation fails, explain what might be wrong and how to fix it.
-8. On success, show the exact same-instance start and doctor commands
+1. Summarize the selected instance, configuration source, and settings without exposing credentials or opaque IDs.
+2. Ask the user to confirm before writing, reusing an existing confirmation only if it covers this exact configuration.
+3. Save configuration at its owning source with mode `0600`, without applying or restarting it yet. For standalone installs, create the resolved home and `{data,logs,runtime,data/messages}` directories with mode `0700` and write `config.env` atomically. For repository-managed installs, edit the tracked source; defer the installer until validation succeeds.
+4. Validate the candidate credentials from that saved source, not the old runtime copy. Read `SKILL_DIR/references/token-validation.md` for the platform checks and keep sensitive responses out of tool output. For Weixin, a successful same-instance QR login counts as validation. If validation fails, report it and leave the running service alone.
+5. After successful validation, apply only deployment or restart actions covered by the request. This includes any installer that can start or restart services. Preserve private directory/config modes through the owning installer.
+6. Report validation, saved source, and running configuration separately; when application is pending, do not report the new configuration as active.
+7. On success, continue any already authorized start step; otherwise report readiness and the same-instance start and doctor commands.
 
 For a named Feishu/Codex fixed instance, write these explicit policy keys and leave `CTI_DEFAULT_MODEL` unset:
 
@@ -151,54 +152,46 @@ CTI_CODEX_NETWORK_ACCESS=true
 
 ### `start`
 
-Run the resolved identity: `CTI_INSTANCE="$INSTANCE" bash "$SKILL_DIR/scripts/daemon.sh" start`.
+Run the resolved identity: `CTI_INSTANCE="$INSTANCE" CTI_HOME="$INSTANCE_HOME" bash "$SKILL_DIR/scripts/daemon.sh" start`.
 
-Show the output to the user. If it fails, tell the user:
-- Run same-instance doctor: `CTI_INSTANCE="$INSTANCE" bash "$SKILL_DIR/scripts/doctor.sh"`
-- Check same-instance logs: `CTI_INSTANCE="$INSTANCE" bash "$SKILL_DIR/scripts/daemon.sh" logs`
+Report the result without exposing credentials. If it fails, inspect same-instance logs and follow the failure evidence within the authorized scope; use doctor when its diagnostic checks are needed. Do not delegate these available checks back to the user.
 
 ### `stop`
 
-Run: `CTI_INSTANCE="$INSTANCE" bash "$SKILL_DIR/scripts/daemon.sh" stop`. This stops/boots out the process but preserves its plist and home for a later start.
+Run: `CTI_INSTANCE="$INSTANCE" CTI_HOME="$INSTANCE_HOME" bash "$SKILL_DIR/scripts/daemon.sh" stop`. This stops/boots out the process but preserves its plist and home for a later start.
 
 ### `status`
 
-Run: `CTI_INSTANCE="$INSTANCE" bash "$SKILL_DIR/scripts/daemon.sh" status`.
+Run: `CTI_INSTANCE="$INSTANCE" CTI_HOME="$INSTANCE_HOME" bash "$SKILL_DIR/scripts/daemon.sh" status`.
 
 ### `logs`
 
 Extract optional line count N from arguments (default 50).
-Run: `CTI_INSTANCE="$INSTANCE" bash "$SKILL_DIR/scripts/daemon.sh" logs N`.
+Run: `CTI_INSTANCE="$INSTANCE" CTI_HOME="$INSTANCE_HOME" bash "$SKILL_DIR/scripts/daemon.sh" logs N`.
 
 ### `reconfigure`
 
-1. Read current config from the resolved instance home
-2. Show current settings in a clear table format, with all secrets masked (only last 4 chars visible)
-3. Ask what the user wants to change using the presentation mode selected above
-4. When collecting new values, tell the user where to find the value; only show the full guide from `SKILL_DIR/references/setup-guides.md` if they ask for help
-5. Update the config file atomically (write to tmp, rename)
-6. Re-validate any changed tokens
-7. Remind the user to stop/start the same instance to apply changes
+Read the current configuration from its owning source without exposing sensitive values. Use the requested changes directly; ask only for missing or ambiguous values as in setup. Confirm the resulting configuration before writing, then use setup Step 4's source, private-write, and application rules. Re-validate changed tokens only. Apply an already authorized same-instance restart; otherwise report that the saved change is not yet applied.
 
-If the user wants to switch Weixin accounts during `reconfigure`, run `cd SKILL_DIR && npm run weixin:login` again. Each successful scan replaces the previously linked local account.
+For a requested Weixin account switch, use the same-instance login command and replacement boundary from setup Step 2.
 
 ### `doctor`
 
-Run: `CTI_INSTANCE="$INSTANCE" bash "$SKILL_DIR/scripts/doctor.sh"` for the same named instance.
+Run: `CTI_INSTANCE="$INSTANCE" CTI_HOME="$INSTANCE_HOME" bash "$SKILL_DIR/scripts/doctor.sh"` for the same instance.
 
 Show results and suggest fixes for any failures. Common fixes:
 - SDK cli.js missing → `cd SKILL_DIR && npm install`
 - dist/daemon.mjs stale → `cd SKILL_DIR && npm run build`
 - Config missing → run `setup`
-- Weixin account missing / expired → `cd SKILL_DIR && npm run weixin:login`
+- Weixin account missing / expired → same-instance login from setup Step 2, when authorized
 - Weixin voice message reports missing speech-to-text → enable WeChat's own voice transcription and resend; the bridge does not transcribe raw voice audio itself
 
 For more complex issues (messages not received, permission timeouts, high memory, stale PID files), read `SKILL_DIR/references/troubleshooting.md` for detailed diagnosis steps.
 
 ### `uninstall` and `remove`
 
-- `CTI_INSTANCE="$INSTANCE" bash "$SKILL_DIR/scripts/daemon.sh" uninstall` stops/unregisters the LaunchAgent but preserves the entire instance home and store.
-- `CTI_INSTANCE="$INSTANCE" bash "$SKILL_DIR/scripts/daemon.sh" remove "$INSTANCE"` deletes that home only after it is stopped and unregistered. The confirmation must exactly match the instance. `remove` refuses `default`.
+- `CTI_INSTANCE="$INSTANCE" CTI_HOME="$INSTANCE_HOME" bash "$SKILL_DIR/scripts/daemon.sh" uninstall` stops/unregisters the LaunchAgent but preserves the entire instance home and store.
+- `CTI_INSTANCE="$INSTANCE" CTI_HOME="$INSTANCE_HOME" bash "$SKILL_DIR/scripts/daemon.sh" remove "$INSTANCE"` deletes that home only after it is stopped and unregistered. The confirmation must exactly match the instance. `remove` refuses `default`.
 
 **Feishu upgrade note:** Read `references/setup-guides.md` before changing scopes/callbacks, then restart and diagnose with the already-bound `INSTANCE`. Keep two publish phases. Do not add `card.action.trigger` to a Codex/never instance merely because generic interactive runtimes use it.
 

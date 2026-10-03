@@ -196,6 +196,8 @@ The wizard will guide you through:
 3. **Set defaults** — working directory, model, and mode
 4. **Validate** — tokens are verified against platform APIs immediately
 
+Setup reuses supplied values, groups independent missing inputs, and confirms the resulting configuration before writing. Status, logs, and diagnosis do not automatically enter setup when config is missing. Repository-managed configurations are edited at their tracked source and applied by their deployment owner; standalone installations write the selected instance's private config. Login and lifecycle commands use the same resolved instance and home.
+
 ### 2. Start
 
 **Claude Code**
