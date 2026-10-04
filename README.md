@@ -4,6 +4,8 @@ Bridge Claude Code / Codex to IM platforms — chat with AI coding agents from T
 
 [中文文档](README_CN.md)
 
+In `ai-agent-config`, this repository is installed as the top-level `claude-to-im/` runtime component. Use `communication-workflows manage-chat-bridge <action>`; its `SKILL.md` is an on-demand guide rather than a second discovered skill. The parent installer calls `scripts/install-from-repo.sh`; the local core dependency lives at `../library/Claude-to-IM`. From the parent repository, check an instance with `CTI_INSTANCE=<instance> bash claude-to-im/scripts/daemon.sh status`. Existing instance homes and configuration sources are preserved. The standalone skill installation instructions below describe a different layout.
+
 > **Want a desktop GUI instead?** Check out [CodePilot](https://github.com/op7418/CodePilot) — a full-featured desktop app with visual chat interface, session management, file tree preview, permission controls, and more. This skill was extracted from CodePilot's IM bridge module for users who prefer a lightweight, CLI-only setup.
 
 ---

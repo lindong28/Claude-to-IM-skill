@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INSTALLER="$SCRIPT_DIR/install-from-repo.sh"
 
 fail() {
@@ -48,7 +48,7 @@ stat_mode() {
 test_root_is_orchestration_only() {
   local root_installer="$REPO_ROOT/install.sh"
 
-  assert_contains "$root_installer" 'claude/skills/claude-to-im/scripts/install-from-repo.sh'
+  assert_contains "$root_installer" 'claude-to-im/scripts/install-from-repo.sh'
   assert_contains "$root_installer" 'skill-configs/*/instances/*/config.env'
   assert_not_contains "$root_installer" 'claude_to_im_needs_restart()'
   assert_not_contains "$root_installer" 'restart_claude_to_im_bridge_if_needed()'
@@ -65,19 +65,19 @@ test_component_installer_converges_dependencies_and_daemon() {
   log="$sandbox/calls.log"
 
   mkdir -p \
-    "$fake_repo/claude/skills/claude-to-im/scripts" \
-    "$fake_repo/claude/skills/claude-to-im/src" \
+    "$fake_repo/claude-to-im/scripts" \
+    "$fake_repo/claude-to-im/src" \
     "$fake_repo/library/Claude-to-IM" \
     "$sandbox/home/Library/LaunchAgents" \
     "$sandbox/home/.claude-to-im-quant-lab" \
     "$stub_bin"
   printf '{"lockfileVersion":3}\n' > "$fake_repo/library/Claude-to-IM/package-lock.json"
-  printf '{"lockfileVersion":3}\n' > "$fake_repo/claude/skills/claude-to-im/package-lock.json"
+  printf '{"lockfileVersion":3}\n' > "$fake_repo/claude-to-im/package-lock.json"
   : > "$sandbox/home/Library/LaunchAgents/com.claude-to-im.bridge.quant-lab.plist"
   : > "$sandbox/home/Library/LaunchAgents/com.claude-to-im.bridge.plist"
   printf 'CTI_RUNTIME=codex\n' > "$sandbox/home/.claude-to-im-quant-lab/config.env"
   printf 'export CTI_TEST_LOG=%q\nprintf "daemon %%s %%s %%s\\n" "${CTI_INSTANCE:-}" "${CTI_HOME:-}" "$1" >> "$CTI_TEST_LOG"\n' "$log" \
-    > "$fake_repo/claude/skills/claude-to-im/scripts/daemon.sh"
+    > "$fake_repo/claude-to-im/scripts/daemon.sh"
 
   cat > "$stub_bin/npm" <<'EOF'
 #!/usr/bin/env bash
@@ -95,6 +95,11 @@ exit 0
 EOF
   cat > "$stub_bin/plutil" <<'EOF'
 #!/usr/bin/env bash
+case "$2" in
+  WorkingDirectory) echo "${CTI_TEST_RUNTIME_ROOT:-old-runtime}" ; exit ;;
+  ProgramArguments) echo 2 ; exit ;;
+  ProgramArguments.1) echo "${CTI_TEST_RUNTIME_ROOT:-old-runtime}/dist/daemon.mjs" ; exit ;;
+esac
 case "$*" in
   *com.claude-to-im.bridge.quant-lab.plist*) echo "$HOME/.claude-to-im-quant-lab" ;;
   *) exit 1 ;;
@@ -104,13 +109,13 @@ EOF
 #!/usr/bin/env bash
 echo Darwin
 EOF
-  chmod +x "$stub_bin"/* "$fake_repo/claude/skills/claude-to-im/scripts/daemon.sh"
+  chmod +x "$stub_bin"/* "$fake_repo/claude-to-im/scripts/daemon.sh"
 
   CTI_TEST_LOG="$log" HOME="$sandbox/home" REPO_DIR="$fake_repo" UPDATE_EXISTING=1 PATH="$stub_bin:$PATH" \
     bash "$INSTALLER"
 
   assert_contains "$log" "npm $fake_repo/library/Claude-to-IM ci"
-  assert_contains "$log" "npm $fake_repo/claude/skills/claude-to-im ci"
+  assert_contains "$log" "npm $fake_repo/claude-to-im ci"
   assert_contains "$log" "daemon quant-lab $sandbox/home/.claude-to-im-quant-lab stop"
   assert_contains "$log" "daemon quant-lab $sandbox/home/.claude-to-im-quant-lab start"
   if grep -Fq -- 'daemon default ' "$log"; then
@@ -118,16 +123,32 @@ EOF
   fi
 
   : > "$log"
-  rm -rf "$fake_repo/library/Claude-to-IM/node_modules" "$fake_repo/claude/skills/claude-to-im/node_modules"
-  : > "$fake_repo/claude/skills/claude-to-im/src/input.ts"
-  touch "$fake_repo/claude/skills/claude-to-im/dist/daemon.mjs"
+  rm -rf "$fake_repo/library/Claude-to-IM/node_modules" "$fake_repo/claude-to-im/node_modules"
+  : > "$fake_repo/claude-to-im/src/input.ts"
+  touch "$fake_repo/claude-to-im/dist/daemon.mjs"
   CTI_TEST_LOG="$log" HOME="$sandbox/home" REPO_DIR="$fake_repo" \
     UPDATE_EXISTING=1 PATH="$stub_bin:$PATH" bash "$INSTALLER"
 
   assert_contains "$log" "npm $fake_repo/library/Claude-to-IM ci"
-  assert_contains "$log" "npm $fake_repo/claude/skills/claude-to-im ci"
+  assert_contains "$log" "npm $fake_repo/claude-to-im ci"
   assert_contains "$log" "daemon quant-lab $sandbox/home/.claude-to-im-quant-lab stop"
   assert_contains "$log" "daemon quant-lab $sandbox/home/.claude-to-im-quant-lab start"
+
+  : > "$log"
+  mkdir -p "$sandbox/home/.claude-to-im"
+  printf 'CTI_RUNTIME=claude\n' > "$sandbox/home/.claude-to-im/config.env"
+  CTI_TEST_LOG="$log" HOME="$sandbox/home" REPO_DIR="$fake_repo" \
+    CTI_MANAGE_DEFAULT=1 PATH="$stub_bin:$PATH" bash "$INSTALLER"
+  assert_contains "$log" "daemon default  stop"
+  assert_contains "$log" "daemon default  start"
+  assert_contains "$log" "daemon quant-lab $sandbox/home/.claude-to-im-quant-lab start"
+  assert_not_contains "$log" "npm "
+
+  : > "$log"
+  CTI_TEST_LOG="$log" CTI_TEST_RUNTIME_ROOT="$fake_repo/claude-to-im" \
+    HOME="$sandbox/home" REPO_DIR="$fake_repo" CTI_MANAGE_DEFAULT=1 \
+    PATH="$stub_bin:$PATH" bash "$INSTALLER"
+  assert_not_contains "$log" "daemon "
 }
 
 test_tracked_named_config_materializes_and_converges_service() {
@@ -144,27 +165,27 @@ test_tracked_named_config_materializes_and_converges_service() {
   default_config="$sandbox/home/.claude-to-im/config.env"
 
   mkdir -p \
-    "$fake_repo/claude/skills/claude-to-im/scripts" \
-    "$fake_repo/claude/skills/claude-to-im/src" \
-    "$fake_repo/claude/skills/claude-to-im/dist" \
+    "$fake_repo/claude-to-im/scripts" \
+    "$fake_repo/claude-to-im/src" \
+    "$fake_repo/claude-to-im/dist" \
     "$fake_repo/library/Claude-to-IM/node_modules" \
-    "$fake_repo/claude/skills/claude-to-im/node_modules" \
+    "$fake_repo/claude-to-im/node_modules" \
     "$fake_repo/skill-configs/claude-to-im/instances/quant-lab" \
     "$sandbox/home/Library/LaunchAgents" \
     "$stub_bin"
   canonical_home="$(realpath "$sandbox/home")/.claude-to-im-quant-lab"
   printf '{"lockfileVersion":3}\n' > "$fake_repo/library/Claude-to-IM/package-lock.json"
-  printf '{"lockfileVersion":3}\n' > "$fake_repo/claude/skills/claude-to-im/package-lock.json"
+  printf '{"lockfileVersion":3}\n' > "$fake_repo/claude-to-im/package-lock.json"
   shasum "$fake_repo/library/Claude-to-IM/package-lock.json" | cut -d' ' -f1 \
     > "$fake_repo/library/Claude-to-IM/node_modules/.lockfile-hash"
-  shasum "$fake_repo/claude/skills/claude-to-im/package-lock.json" | cut -d' ' -f1 \
-    > "$fake_repo/claude/skills/claude-to-im/node_modules/.lockfile-hash"
-  : > "$fake_repo/claude/skills/claude-to-im/dist/daemon.mjs"
+  shasum "$fake_repo/claude-to-im/package-lock.json" | cut -d' ' -f1 \
+    > "$fake_repo/claude-to-im/node_modules/.lockfile-hash"
+  : > "$fake_repo/claude-to-im/dist/daemon.mjs"
   cp "$SKILL_DIR/scripts/instance-env.sh" \
-    "$fake_repo/claude/skills/claude-to-im/scripts/instance-env.sh"
+    "$fake_repo/claude-to-im/scripts/instance-env.sh"
   printf 'CTI_RUNTIME=codex\nCTI_ENABLED_CHANNELS=feishu\n' \
     > "$fake_repo/skill-configs/claude-to-im/instances/quant-lab/config.env"
-  cat > "$fake_repo/claude/skills/claude-to-im/scripts/daemon.sh" <<'EOF'
+  cat > "$fake_repo/claude-to-im/scripts/daemon.sh" <<'EOF'
 #!/usr/bin/env bash
 printf 'daemon %s %s %s\n' "${CTI_INSTANCE:-}" "${CTI_HOME:-}" "$1" >> "$CTI_TEST_LOG"
 if [ "$1" = stop ]; then
@@ -173,10 +194,20 @@ elif [ "$1" = start ]; then
   [ "${CTI_TEST_FAIL_START:-0}" != "1" ] || exit 70
   : > "$CTI_TEST_SERVICE_STATE"
   mkdir -p "$HOME/Library/LaunchAgents"
-  : > "$HOME/Library/LaunchAgents/com.claude-to-im.bridge.${CTI_INSTANCE}.plist"
+  (cd "$(dirname "$0")/.." && pwd) > "$HOME/Library/LaunchAgents/com.claude-to-im.bridge.${CTI_INSTANCE}.plist"
 fi
 EOF
 
+  cat > "$stub_bin/plutil" <<'EOF'
+#!/usr/bin/env bash
+root="$(cat "${@: -1}")"
+case "$2" in
+  WorkingDirectory) echo "$root" ;;
+  ProgramArguments) echo 2 ;;
+  ProgramArguments.1) echo "$root/dist/daemon.mjs" ;;
+  *) exit 1 ;;
+esac
+EOF
   cat > "$stub_bin/launchctl" <<'EOF'
 #!/usr/bin/env bash
 [ -e "$CTI_TEST_SERVICE_STATE" ]
@@ -209,7 +240,7 @@ EOF
 #!/usr/bin/env bash
 echo Darwin
 EOF
-  chmod +x "$stub_bin"/* "$fake_repo/claude/skills/claude-to-im/scripts/daemon.sh"
+  chmod +x "$stub_bin"/* "$fake_repo/claude-to-im/scripts/daemon.sh"
 
   mkdir -p "$sandbox/home/.claude-to-im"
   printf 'DEFAULT_SENTINEL=unchanged\n' > "$default_config"
@@ -222,7 +253,7 @@ EOF
     || fail "default config was overwritten before named-home identity validation"
   rm "$sandbox/home/.claude-to-im-quant-lab"
 
-  rm "$fake_repo/claude/skills/claude-to-im/dist/daemon.mjs"
+  rm "$fake_repo/claude-to-im/dist/daemon.mjs"
   if CTI_TEST_FAIL_BUILD=1 CTI_TEST_LOG="$log" CTI_TEST_SERVICE_STATE="$service_state" \
     HOME="$sandbox/home" REPO_DIR="$fake_repo" PATH="$stub_bin:$PATH" \
     bash "$INSTALLER" >/dev/null 2>&1; then
@@ -230,7 +261,7 @@ EOF
   fi
   [ ! -e "$target_config" ] \
     || fail "tracked config was materialized before the bundle build succeeded"
-  : > "$fake_repo/claude/skills/claude-to-im/dist/daemon.mjs"
+  : > "$fake_repo/claude-to-im/dist/daemon.mjs"
 
   # §3.6 opt-in: without INSTALL_SERVICES=1 a never-installed instance is
   # materialized for later runs but not deployed.
@@ -274,6 +305,17 @@ EOF
     REPO_DIR="$fake_repo" PATH="$stub_bin:$PATH" bash "$INSTALLER"
   [ ! -s "$log" ] || fail "unchanged tracked config restarted the managed instance"
 
+  # Same bundle/config, different runtime location must still converge.
+  printf 'old-runtime\n' > "$sandbox/home/Library/LaunchAgents/com.claude-to-im.bridge.quant-lab.plist"
+  CTI_TEST_LOG="$log" CTI_TEST_SERVICE_STATE="$service_state" HOME="$sandbox/home" \
+    REPO_DIR="$fake_repo" PATH="$stub_bin:$PATH" bash "$INSTALLER"
+  assert_contains "$log" "daemon quant-lab $canonical_home stop"
+  assert_contains "$log" "daemon quant-lab $canonical_home start"
+  : > "$log"
+  CTI_TEST_LOG="$log" CTI_TEST_SERVICE_STATE="$service_state" HOME="$sandbox/home" \
+    REPO_DIR="$fake_repo" PATH="$stub_bin:$PATH" bash "$INSTALLER"
+  [ ! -s "$log" ] || fail "converged runtime path restarted again"
+
   printf 'CTI_DEFAULT_MODE=code\n' \
     >> "$fake_repo/skill-configs/claude-to-im/instances/quant-lab/config.env"
   CTI_TEST_LOG="$log" CTI_TEST_SERVICE_STATE="$service_state" HOME="$sandbox/home" \
@@ -282,7 +324,7 @@ EOF
   assert_contains "$log" "daemon quant-lab $canonical_home start"
 
   : > "$log"
-  printf 'new bundle snapshot\n' >> "$fake_repo/claude/skills/claude-to-im/dist/daemon.mjs"
+  printf 'new bundle snapshot\n' >> "$fake_repo/claude-to-im/dist/daemon.mjs"
   CTI_TEST_LOG="$log" CTI_TEST_SERVICE_STATE="$service_state" HOME="$sandbox/home" \
     REPO_DIR="$fake_repo" PATH="$stub_bin:$PATH" bash "$INSTALLER"
   assert_contains "$log" "daemon quant-lab $canonical_home stop"

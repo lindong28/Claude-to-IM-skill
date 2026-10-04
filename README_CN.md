@@ -4,6 +4,8 @@
 
 [English](README.md)
 
+在 `ai-agent-config` 中，本仓作为顶层 `claude-to-im/` 运行组件安装，使用 `communication-workflows manage-chat-bridge <动作>` 进入；`SKILL.md` 是按需操作指引，不再作为第二个 skill 被发现。父仓安装器调用 `scripts/install-from-repo.sh`，本地 core 依赖位于 `../library/Claude-to-IM`。在父仓运行 `CTI_INSTANCE=<实例> bash claude-to-im/scripts/daemon.sh status` 检查状态。实例 home 与配置来源保留。下文独立 skill 安装说明描述的是另一种布局。
+
 > **想要桌面图形界面？** 试试 [CodePilot](https://github.com/op7418/CodePilot) —— 一个功能完整的桌面应用，提供可视化聊天界面、会话管理、文件树预览、权限控制等。本 Skill 从 CodePilot 的 IM 桥接模块中提取而来，适合偏好轻量级纯 CLI 方案的用户。
 
 ---

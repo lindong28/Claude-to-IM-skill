@@ -2,8 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_DIR="${REPO_DIR:-$(cd "$SCRIPT_DIR/../../../.." && pwd)}"
-CTI_SKILL="$REPO_DIR/claude/skills/claude-to-im"
+REPO_DIR="${REPO_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
+CTI_SKILL="$REPO_DIR/claude-to-im"
 CTI_CORE="$REPO_DIR/library/Claude-to-IM"
 UPDATE_EXISTING="${UPDATE_EXISTING:-0}"
 INSTALL_SERVICES="${INSTALL_SERVICES:-0}"
@@ -150,7 +150,17 @@ daemon_bundle_is_stale() {
   return 1
 }
 
+service_location_matches() {
+  local plist="$1"
+  local count
+  [ "$(plutil -extract WorkingDirectory raw -o - "$plist" 2>/dev/null || true)" = "$CTI_SKILL" ] || return 1
+  count="$(plutil -extract ProgramArguments raw -o - "$plist" 2>/dev/null || true)"
+  [[ "$count" =~ ^[1-9][0-9]*$ ]] || return 1
+  [ "$(plutil -extract "ProgramArguments.$((count - 1))" raw -o - "$plist" 2>/dev/null || true)" = "$CTI_SKILL/dist/daemon.mjs" ]
+}
+
 restart_managed_instances() {
+  local bundle_changed="$1"
   if [ "$(uname -s)" != "Darwin" ] || ! command -v launchctl >/dev/null 2>&1; then
     echo "→ claude-to-im bundle rebuilt; automatic service restart is only available for launchd"
     return
@@ -175,6 +185,9 @@ restart_managed_instances() {
       continue
     fi
 
+    if [ "$bundle_changed" != "1" ] && service_location_matches "$plist"; then
+      continue
+    fi
     cti_home=""
     if command -v plutil >/dev/null 2>&1; then
       cti_home="$(plutil -extract EnvironmentVariables.CTI_HOME raw -o - "$plist" 2>/dev/null || true)"
@@ -202,7 +215,7 @@ restart_managed_instances() {
   done
   shopt -u nullglob
 
-  [ "$restarted" = "1" ] || echo "→ claude-to-im bundle rebuilt; no managed launchd instances found"
+  [ "$restarted" = "1" ] || [ "$bundle_changed" != "1" ] || echo "→ claude-to-im bundle rebuilt; no managed launchd instances found"
 }
 
 converge_tracked_instance_services() {
@@ -231,7 +244,7 @@ converge_tracked_instance_services() {
 
     if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
       managed=1
-      if [ "$bundle_changed" = "1" ] || [ "$config_pending" = "1" ] || [ -f "$pending_marker" ]; then
+      if [ "$bundle_changed" = "1" ] || [ "$config_pending" = "1" ] || [ -f "$pending_marker" ] || ! service_location_matches "$plist"; then
         should_converge=1
       fi
     elif [ -f "$pending_marker" ]; then
@@ -273,9 +286,9 @@ if daemon_bundle_is_stale; then
 fi
 materialize_tracked_instance_configs
 if [ "$CTI_DEPENDENCIES_CHANGED" = "1" ] || [ "$bundle_rebuilt" = "1" ]; then
-  restart_managed_instances
   bundle_changed=1
 else
   bundle_changed=0
 fi
+restart_managed_instances "$bundle_changed"
 converge_tracked_instance_services "$bundle_changed"

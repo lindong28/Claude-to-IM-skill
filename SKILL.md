@@ -24,9 +24,7 @@ allowed-tools:
 # Claude-to-IM Bridge Skill
 
 You are managing the Claude-to-IM bridge.
-The skill directory (SKILL_DIR) is at `~/.claude/skills/claude-to-im`.
-In Codex installs it may instead be `~/.codex/skills/Claude-to-IM-skill`.
-If neither path exists, fall back to Glob with pattern `**/skills/**/claude-to-im/SKILL.md` or `**/skills/**/Claude-to-IM-skill/SKILL.md` and derive the root from the result.
+Set `SKILL_DIR` to the real directory containing this file. A workflow router may load this guide from a runtime component outside the skill discovery directories; use that resolved location for scripts and resources. Standalone installations may still place it under `~/.claude/skills/claude-to-im` or `~/.codex/skills/Claude-to-IM-skill`.
 
 Resolve one instance identity before accessing its config or state and bind it as `INSTANCE`. Use `default` unless the user names an instance. Resolve its home through `scripts/instance-env.sh`, preserving an explicit `CTI_HOME` only when it belongs to the selected instance. The resolver derives the default or named home and checks ownership and unsafe aliases. Bind its result as `INSTANCE_HOME`; stop if resolution fails. Keep both values for setup, lifecycle, diagnosis, and login:
 

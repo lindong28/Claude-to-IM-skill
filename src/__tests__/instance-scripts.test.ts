@@ -1150,14 +1150,14 @@ describe('portable instance contracts', () => {
     const fixture = createPortableDoctorFixture();
     try {
       const tempRoot = path.join(fixture.home, 'repo');
-      const tempScripts = path.join(tempRoot, 'claude', 'skills', 'claude-to-im', 'scripts');
+      const tempScripts = path.join(tempRoot, 'claude-to-im', 'scripts');
       fs.mkdirSync(tempScripts, { recursive: true });
       for (const script of ['install-from-repo.test.sh', 'install-from-repo.sh', 'instance-env.sh']) {
         fs.copyFileSync(path.join(SCRIPTS_DIR, script), path.join(tempScripts, script));
       }
       fs.writeFileSync(
         path.join(tempRoot, 'install.sh'),
-        'claude/skills/claude-to-im/scripts/install-from-repo.sh\n' +
+        'claude-to-im/scripts/install-from-repo.sh\n' +
           'skill-configs/*/instances/*/config.env\n',
       );
       const result = spawnSync('/bin/bash', [path.join(tempScripts, 'install-from-repo.test.sh')], {
