@@ -395,9 +395,15 @@ describe('instance-aware macOS lifecycle scripts', {
     assert.equal(fs.existsSync(namedHome), true);
     assert.equal(fs.existsSync(namedPlist), true);
 
-    shell('bash scripts/daemon.sh uninstall', { ...env, CTI_INSTANCE: 'quant-lab' });
+    // This fixture is deliberately not a valid owned plist. The conservative
+    // uninstall guard must preserve it; acceptance cases use the pure tests.
+    const uninstall = spawnSync('/bin/bash', [path.join(SCRIPTS_DIR, 'daemon.sh'), 'uninstall'], {
+      env: { ...process.env, ...env, CTI_INSTANCE: 'quant-lab' }, encoding: 'utf8',
+    });
+    assert.notEqual(uninstall.status, 0);
+    assert.match(uninstall.stderr, /Uninstall refused/);
     assert.equal(fs.existsSync(namedHome), true);
-    assert.equal(fs.existsSync(namedPlist), false);
+    assert.equal(fs.existsSync(namedPlist), true);
 
     const mismatch = spawnSync(
       '/bin/bash',

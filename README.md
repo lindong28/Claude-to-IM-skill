@@ -266,7 +266,7 @@ CTI_INSTANCE="$INSTANCE" bash ~/.claude/skills/claude-to-im/scripts/daemon.sh re
 CTI_INSTANCE="$INSTANCE" bash ~/.claude/skills/claude-to-im/scripts/doctor.sh
 ```
 
-`stop` stops/boots out the process but preserves its plist and home. `uninstall` also removes the plist while preserving the home and store. `remove` requires an exact instance-name confirmation, a stopped/unregistered instance, and deletes only that named home; it refuses `default`.
+`stop` stops/boots out the process but preserves its plist and home. On macOS, `uninstall` refuses every registered LaunchAgent, including stopped or owned jobs, and any unverified state. It removes only a matching plist after confirming that the selected job is absent in the same user’s Aqua launchd context; if both are absent it succeeds without cleanup. It does not stop processes or remove PID files, the home, or the store. A refusal requires reviewing the selected instance and LaunchAgent ownership; do not use `stop` as a workaround for this guard. Other platforms retain their existing uninstall behavior. `remove` requires an exact instance-name confirmation, a stopped/unregistered instance, and deletes only that named home; it refuses `default`.
 
 ## Platform Setup Guides
 

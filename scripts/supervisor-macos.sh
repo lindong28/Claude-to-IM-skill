@@ -177,9 +177,26 @@ supervisor_stop() {
 }
 
 supervisor_uninstall() {
-  supervisor_stop
-  supervisor_assert_selected_stopped
-  rm -f "$PLIST_FILE"
+  local ownership node_path
+  node_path=$(command -v node) || {
+    echo "Uninstall refused: Node.js is unavailable; no resources were removed." >&2
+    return 1
+  }
+  ownership=$("$node_path" "$SKILL_DIR/scripts/macos-uninstall-identity.mjs" \
+    "$LAUNCHD_LABEL" "$SKILL_DIR" "$CTI_HOME" "$CTI_INSTANCE" "$PLIST_FILE" "$node_path") || return 1
+  case "$ownership" in
+    owned)
+      rm -f "$PLIST_FILE" || return 1
+      echo "Selected LaunchAgent plist removed; PID file and instance data preserved. No process was stopped."
+      ;;
+    absent)
+      echo "Selected LaunchAgent and plist are absent; PID file and instance data preserved. No process was stopped."
+      ;;
+    *)
+      echo "Uninstall refused: ownership check returned an unknown result; no resources were removed." >&2
+      return 1
+      ;;
+  esac
 }
 
 supervisor_is_managed() {
