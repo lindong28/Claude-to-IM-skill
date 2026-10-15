@@ -262,7 +262,7 @@ CTI_INSTANCE="$INSTANCE" bash ~/.claude/skills/claude-to-im/scripts/daemon.sh re
 CTI_INSTANCE="$INSTANCE" bash ~/.claude/skills/claude-to-im/scripts/doctor.sh
 ```
 
-`stop` 停止/bootout 进程，但保留 plist 和 home；`uninstall` 还会删除 plist，但保留 home/store；`remove` 要求实例已停止、已注销且确认参数与实例名完全一致，只删除该 named home，并拒绝删除 `default`。
+`stop` 停止/bootout 进程，但保留 plist 和 home。macOS 上的 `uninstall` 拒绝所有已注册的 LaunchAgent（包括已停止的 job）和无法核实的状态；只有在同一用户的 Aqua launchd 上下文确认所选 job 不存在后，才删除身份匹配的 plist，job 与 plist 均不存在时成功且不清理。它不停止进程，不删除 PID 文件、home 或 store。被拒绝后须核对所选实例与 LaunchAgent 归属，不要通过 `stop` 绕过此守卫；其他平台保留原卸载行为。`remove` 要求实例已停止、已注销且确认参数与实例名完全一致，只删除该 named home，并拒绝删除 `default`。
 
 ## 平台配置指南
 

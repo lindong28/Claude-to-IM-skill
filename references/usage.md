@@ -101,7 +101,7 @@ CTI_INSTANCE="$INSTANCE" bash "$CTI_SKILL_DIR/scripts/daemon.sh" uninstall
 CTI_INSTANCE="$INSTANCE" bash "$CTI_SKILL_DIR/scripts/daemon.sh" remove "$INSTANCE"
 ```
 
-`uninstall` stops the service and removes its plist but preserves the instance home/store. `remove` requires the instance to be stopped and unregistered, requires the exact instance name as confirmation, and deletes only that named home. The default instance cannot be removed.
+On macOS, `uninstall` refuses any registered LaunchAgent, including stopped jobs, and any unverified launchd context or plist identity. It removes only the matching plist after confirming the selected job is absent in the same user’s Aqua context; an absent job and plist is a successful no-op. It never stops processes or removes PID files, the instance home or store. Review the selected instance and LaunchAgent ownership after a refusal; do not use `stop` to work around this guard. Other platforms retain their existing uninstall behavior. `remove` requires the instance to be stopped and unregistered, requires the exact instance name as confirmation, and deletes only that named home. The default instance cannot be removed.
 
 ## reconfigure
 
